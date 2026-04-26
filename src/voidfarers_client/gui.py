@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QVBoxLayout,
     QWidget,
+    QListWidget,
 )
 
 from .app_state import (
@@ -78,6 +79,7 @@ class VoiceWorker(QObject):
     system_changed = Signal(str, str)
     participant_joined = Signal(str, str)
     participant_left = Signal(str, str)
+    participants_snapshot = Signal(list)
     stats = Signal(bool, float, int, int)
 
     def __init__(self, settings: ClientSettings, use_journal: bool) -> None:
@@ -118,6 +120,16 @@ class VoiceWorker(QObject):
         if self.voice:
             self.voice.running = False
 
+    @Slot(bool)
+    def set_muted(self, muted: bool) -> None:
+        if self.audio:
+            self.audio.set_muted(muted)
+
+    @Slot(bool)
+    def set_deafened(self, deafened: bool) -> None:
+        if self.audio:
+            self.audio.set_deafened(deafened)
+
     async def _run(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._thread_id = threading.get_ident()
@@ -128,6 +140,8 @@ class VoiceWorker(QObject):
             input_device=self.settings.input_device,
             output_device=self.settings.output_device,
         )
+        self.audio.set_muted(self.settings.muted)
+        self.audio.set_deafened(self.settings.deafened)
 
         self.voice = VoiceClient(
             backend_url=self.settings.backend_url,
@@ -160,6 +174,7 @@ class VoiceWorker(QObject):
                 )
                 await self.voice.connect_to_system(state)
                 self.connected.emit(state.system_name, state.system_address)
+                self.emit_participants_snapshot()
 
                 while self.voice.running and not self._stop_requested:
                     await asyncio.sleep(0.2)
@@ -199,6 +214,7 @@ class VoiceWorker(QObject):
 
             await self.voice.connect_to_system(state)
             self.connected.emit(state.system_name, state.system_address)
+            self.emit_participants_snapshot()
 
     async def _stats_loop(self) -> None:
         while not self._stop_requested:
@@ -237,6 +253,17 @@ class VoiceWorker(QObject):
 
         self.log.emit("Disconnected.")
 
+    def emit_participants_snapshot(self) -> None:
+        if not self.voice or not self.voice.room:
+            self.participants_snapshot.emit([])
+            return
+
+        participants = []
+
+        for participant in self.voice.room.remote_participants.values():
+            participants.append((participant.identity, participant.name))
+
+        self.participants_snapshot.emit(participants)
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -275,9 +302,11 @@ class MainWindow(QMainWindow):
         self.display_name_edit = QLineEdit()
         self.client_id_edit = QLineEdit()
         self.client_id_edit.setPlaceholderText("Generated automatically if empty")
+        self.backend_url_edit = QLineEdit()
 
         identity_layout.addRow("Display name:", self.display_name_edit)
         identity_layout.addRow("Client ID:", self.client_id_edit)
+        identity_layout.addRow("Backend URL:", self.backend_url_edit)
 
         root_layout.addWidget(identity_box)
 
@@ -325,13 +354,16 @@ class MainWindow(QMainWindow):
 
         self.mute_checkbox = QCheckBox("Mute microphone")
         self.deafen_checkbox = QCheckBox("Deafen output")
-        self.mute_checkbox.setEnabled(False)
-        self.deafen_checkbox.setEnabled(False)
 
         audio_layout.addRow("Input device:", self.input_device_combo)
         audio_layout.addRow("Output device:", self.output_device_combo)
         audio_layout.addRow("", self.refresh_devices_button)
         audio_layout.addRow("PTT key:", self.ptt_key_edit)
+        audio_layout.addRow("", self.mute_checkbox)
+        audio_layout.addRow("", self.deafen_checkbox)
+
+        self.mute_checkbox.toggled.connect(self._on_mute_toggled)
+        self.deafen_checkbox.toggled.connect(self._on_deafen_toggled)
 
         root_layout.addWidget(audio_box)
 
@@ -367,6 +399,14 @@ class MainWindow(QMainWindow):
         self.disconnect_button.clicked.connect(self._disconnect)
         self.save_button.clicked.connect(self._save_settings_from_ui)
 
+        participants_box = QGroupBox("Participants")
+        participants_layout = QVBoxLayout(participants_box)
+
+        self.participants_list = QListWidget()
+        participants_layout.addWidget(self.participants_list)
+
+        root_layout.addWidget(participants_box)
+
         buttons_layout.addWidget(self.connect_button)
         buttons_layout.addWidget(self.disconnect_button)
         buttons_layout.addStretch()
@@ -396,6 +436,9 @@ class MainWindow(QMainWindow):
 
         journal_dir = config_get(self.config, "journal_dir", str(default_journal_dir()))
         self.journal_dir_edit.setText(str(journal_dir))
+        self.backend_url_edit.setText(str(config_get(self.config, "backend_url", DEFAULT_BACKEND_URL)))
+        self.mute_checkbox.setChecked(bool(config_get(self.config, "muted", False)))
+        self.deafen_checkbox.setChecked(bool(config_get(self.config, "deafened", False)))
 
     def _populate_audio_devices(self) -> None:
         saved_input = self.config.get("input_device")
@@ -450,9 +493,11 @@ class MainWindow(QMainWindow):
 
         journal_dir_text = self.journal_dir_edit.text().strip()
         journal_dir = Path(journal_dir_text) if journal_dir_text else default_journal_dir()
+        muted=self.mute_checkbox.isChecked(),
+        deafened=self.deafen_checkbox.isChecked(),
 
         return ClientSettings(
-            backend_url=DEFAULT_BACKEND_URL,
+            backend_url=self.backend_url_edit.text().strip() or DEFAULT_BACKEND_URL,
             client_id=client_id,
             display_name=display_name,
             ptt_key=ptt_key,
@@ -461,6 +506,8 @@ class MainWindow(QMainWindow):
             journal_dir=journal_dir,
             system_name=system_name,
             system_address=system_address,
+            muted=self.mute_checkbox.isChecked(),
+            deafened=self.deafen_checkbox.isChecked(),
         )
 
     def _save_settings_from_ui(self) -> None:
@@ -477,6 +524,8 @@ class MainWindow(QMainWindow):
                 "journal_dir": str(settings.journal_dir),
                 "system_address": settings.system_address,
                 "system_name": settings.system_name,
+                "muted": settings.muted,
+                "deafened": settings.deafened,
             },
             self.config_path,
         )
@@ -487,6 +536,7 @@ class MainWindow(QMainWindow):
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.display_name_edit.setEnabled(enabled)
         self.client_id_edit.setEnabled(enabled)
+        self.backend_url_edit.setEnabled(enabled)
         self.static_radio.setEnabled(enabled)
         self.journal_radio.setEnabled(enabled)
         self.system_name_edit.setEnabled(enabled)
@@ -521,6 +571,7 @@ class MainWindow(QMainWindow):
         self.worker.system_changed.connect(self._on_system_changed)
         self.worker.participant_joined.connect(self._on_participant_joined)
         self.worker.participant_left.connect(self._on_participant_left)
+        self.worker.participants_snapshot.connect(self._on_participants_snapshot)
         self.worker.stats.connect(self._on_stats)
 
         self.worker.disconnected.connect(self.worker_thread.quit)
@@ -562,6 +613,7 @@ class MainWindow(QMainWindow):
         self.ptt_status_label.setText("--")
         self.mic_meter.setValue(0)
         self.output_buffer_label.setText("0 ms")
+        self.participants_list.clear()
 
     @Slot(str, str)
     def _on_system_changed(self, system_name: str, system_address: str) -> None:
@@ -571,9 +623,34 @@ class MainWindow(QMainWindow):
     def _on_participant_joined(self, identity: str, name: str) -> None:
         self.log(f"Participant joined: {identity} / {name}")
 
+        # Remove placeholder if present.
+        for i in range(self.participants_list.count()):
+            if self.participants_list.item(i).text() == "No other participants":
+                self.participants_list.takeItem(i)
+                break
+
+        label = f"{name} ({identity})" if name else identity
+
+        existing = [
+            self.participants_list.item(i).text()
+            for i in range(self.participants_list.count())
+        ]
+
+        if label not in existing:
+            self.participants_list.addItem(label)
+
     @Slot(str, str)
     def _on_participant_left(self, identity: str, name: str) -> None:
         self.log(f"Participant left: {identity} / {name}")
+
+        for i in range(self.participants_list.count()):
+            text = self.participants_list.item(i).text()
+            if identity in text:
+                self.participants_list.takeItem(i)
+                break
+
+        if self.participants_list.count() == 0:
+            self.participants_list.addItem("No other participants")
 
     @Slot(bool, float, int, int)
     def _on_stats(self, ptt_active: bool, mic_level: float, output_ms: int, dropped: int) -> None:
@@ -586,6 +663,28 @@ class MainWindow(QMainWindow):
     def _on_error(self, message: str) -> None:
         self.log(f"ERROR: {message}")
         QMessageBox.warning(self, "Voidfarers Error", message)
+
+    @Slot(bool)
+    def _on_mute_toggled(self, checked: bool) -> None:
+        if self.worker:
+            self.worker.set_muted(checked)
+
+    @Slot(bool)
+    def _on_deafen_toggled(self, checked: bool) -> None:
+        if self.worker:
+            self.worker.set_deafened(checked)
+
+    @Slot(list)
+    def _on_participants_snapshot(self, participants: list) -> None:
+        self.participants_list.clear()
+
+        if not participants:
+            self.participants_list.addItem("No other participants")
+            return
+
+        for identity, name in participants:
+            label = f"{name} ({identity})" if name else identity
+            self.participants_list.addItem(label)
 
     def log(self, message: str) -> None:
         self.log_output.appendPlainText(message)

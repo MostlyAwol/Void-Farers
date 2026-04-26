@@ -44,6 +44,9 @@ class AudioEngine:
 
         self.running = False
 
+        self.muted = False
+        self.deafened = False
+
         self.mic_queue: queue.Queue[rtc.AudioFrame] = queue.Queue(maxsize=60)
         self.output_buffer = bytearray()
         self.output_lock = threading.Lock()
@@ -55,6 +58,16 @@ class AudioEngine:
         self.last_input_status = ""
         self.last_output_status = ""
         self.frames_dropped = 0
+
+    def set_muted(self, muted: bool) -> None:
+        self.muted = muted
+        if muted:
+            self.last_mic_level = 0.0
+
+    def set_deafened(self, deafened: bool) -> None:
+        self.deafened = deafened
+        if deafened:
+            self.clear_output_buffer()
 
     def start(self) -> None:
         self.running = True
@@ -101,6 +114,9 @@ class AudioEngine:
             self.output_buffer.clear()
 
     def append_output_audio(self, audio_bytes: bytes) -> None:
+        if self.deafened:
+            return
+
         with self.output_lock:
             self.output_buffer.extend(audio_bytes)
 
@@ -130,7 +146,7 @@ class AudioEngine:
         if not self.running:
             return
 
-        if self.ptt.active:
+        if self.ptt.active and not self.muted:
             samples = indata[:, 0].copy()
             float_samples = samples.astype(np.float32)
             rms = float(np.sqrt(np.mean(float_samples * float_samples)) / 32768.0)
@@ -166,6 +182,10 @@ class AudioEngine:
             self.last_output_status = str(status)
 
         bytes_needed = frames * NUM_CHANNELS * 2
+
+        if self.deafened:
+            outdata[:, 0] = np.zeros(frames, dtype=np.int16)
+            return
 
         with self.output_lock:
             available = len(self.output_buffer)

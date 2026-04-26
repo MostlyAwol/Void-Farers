@@ -33,6 +33,9 @@ class ClientSettings:
     input_device: int | None = None
     output_device: int | None = None
 
+    muted: bool = False
+    deafened: bool = False
+
     journal_dir: Path | None = None
 
     system_address: str = DEFAULT_SYSTEM_ADDRESS
