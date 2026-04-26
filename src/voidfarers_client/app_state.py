@@ -36,6 +36,10 @@ class ClientSettings:
     muted: bool = False
     deafened: bool = False
 
+    start_minimized: bool = False
+    auto_connect: bool = False
+    minimize_to_tray: bool = True
+
     journal_dir: Path | None = None
 
     system_address: str = DEFAULT_SYSTEM_ADDRESS

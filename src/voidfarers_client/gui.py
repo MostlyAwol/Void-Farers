@@ -9,6 +9,7 @@ from typing import Any
 
 import sounddevice as sd
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -19,15 +20,17 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
     QProgressBar,
     QRadioButton,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
-    QListWidget,
 )
 
 from .app_state import (
@@ -277,6 +280,7 @@ class MainWindow(QMainWindow):
 
         self.worker_thread: QThread | None = None
         self.worker: VoiceWorker | None = None
+        self._really_quit = False
 
         self.input_devices: list[tuple[int, str]] = []
         self.output_devices: list[tuple[int, str]] = []
@@ -284,9 +288,84 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._load_settings_into_ui()
         self._populate_audio_devices()
+        self._setup_tray()
+
+        if bool(config_get(self.config, "start_minimized", False)):
+            QTimer.singleShot(0, self.hide)
+
+        if bool(config_get(self.config, "auto_connect", False)):
+            QTimer.singleShot(500, self._connect)
 
         self.stats_timer = QTimer(self)
         self.stats_timer.setInterval(1000)
+
+    def _setup_tray(self) -> None:
+        self.tray_icon = QSystemTrayIcon(self)
+
+        # Uses a built-in generic icon for now. We can replace with a real app icon later.
+        icon = self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon)
+        self.tray_icon.setIcon(icon)
+        self.setWindowIcon(icon)
+
+        tray_menu = QMenu(self)
+
+        self.show_action = QAction("Show Voidfarers", self)
+        self.show_action.triggered.connect(self._show_from_tray)
+        tray_menu.addAction(self.show_action)
+
+        self.connect_action = QAction("Connect", self)
+        self.connect_action.triggered.connect(self._connect)
+        tray_menu.addAction(self.connect_action)
+
+        self.disconnect_action = QAction("Disconnect", self)
+        self.disconnect_action.triggered.connect(self._disconnect)
+        self.disconnect_action.setEnabled(False)
+        tray_menu.addAction(self.disconnect_action)
+
+        tray_menu.addSeparator()
+
+        self.quit_action = QAction("Quit", self)
+        self.quit_action.triggered.connect(self._quit_from_tray)
+        tray_menu.addAction(self.quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.setToolTip("Voidfarers Voice Client")
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _show_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self) -> None:
+        self._really_quit = True
+
+        if self.tray_icon:
+            self.tray_icon.hide()
+
+        if self.worker:
+            self.status_label.setText("Quitting...")
+            self.worker.request_stop()
+
+            # Give the worker a moment to disconnect cleanly, then force the app exit path.
+            QTimer.singleShot(1000, self._force_quit)
+        else:
+            self._force_quit()
+
+    def _force_quit(self) -> None:
+        self._really_quit = True
+
+        if self.tray_icon:
+            self.tray_icon.hide()
+
+        app = QApplication.instance()
+        if app:
+            app.quit()
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._show_from_tray()
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -367,6 +446,21 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(audio_box)
 
+        startup_box = QGroupBox("Startup / Tray")
+        startup_layout = QVBoxLayout(startup_box)
+
+        self.start_minimized_checkbox = QCheckBox("Start minimized")
+        self.auto_connect_checkbox = QCheckBox("Auto-connect on launch")
+        self.minimize_to_tray_checkbox = QCheckBox("Minimize/close to tray")
+        self.minimize_to_tray_checkbox.setChecked(True)
+
+        startup_layout.addWidget(self.start_minimized_checkbox)
+        startup_layout.addWidget(self.auto_connect_checkbox)
+        startup_layout.addWidget(self.minimize_to_tray_checkbox)
+
+        root_layout.addWidget(startup_box)
+
+
         status_box = QGroupBox("Live Status")
         status_layout = QFormLayout(status_box)
 
@@ -440,6 +534,10 @@ class MainWindow(QMainWindow):
         self.mute_checkbox.setChecked(bool(config_get(self.config, "muted", False)))
         self.deafen_checkbox.setChecked(bool(config_get(self.config, "deafened", False)))
 
+        self.start_minimized_checkbox.setChecked(bool(config_get(self.config, "start_minimized", False)))
+        self.auto_connect_checkbox.setChecked(bool(config_get(self.config, "auto_connect", False)))
+        self.minimize_to_tray_checkbox.setChecked(bool(config_get(self.config, "minimize_to_tray", True)))        
+
     def _populate_audio_devices(self) -> None:
         saved_input = self.config.get("input_device")
         saved_output = self.config.get("output_device")
@@ -503,11 +601,14 @@ class MainWindow(QMainWindow):
             ptt_key=ptt_key,
             input_device=self.input_device_combo.currentData(),
             output_device=self.output_device_combo.currentData(),
+            muted=self.mute_checkbox.isChecked(),
+            deafened=self.deafen_checkbox.isChecked(),
+            start_minimized=self.start_minimized_checkbox.isChecked(),
+            auto_connect=self.auto_connect_checkbox.isChecked(),
+            minimize_to_tray=self.minimize_to_tray_checkbox.isChecked(),
             journal_dir=journal_dir,
             system_name=system_name,
             system_address=system_address,
-            muted=self.mute_checkbox.isChecked(),
-            deafened=self.deafen_checkbox.isChecked(),
         )
 
     def _save_settings_from_ui(self) -> None:
@@ -521,11 +622,14 @@ class MainWindow(QMainWindow):
                 "ptt_key": settings.ptt_key,
                 "input_device": settings.input_device,
                 "output_device": settings.output_device,
+                "muted": settings.muted,
+                "deafened": settings.deafened,
+                "start_minimized": settings.start_minimized,
+                "auto_connect": settings.auto_connect,
+                "minimize_to_tray": settings.minimize_to_tray,
                 "journal_dir": str(settings.journal_dir),
                 "system_address": settings.system_address,
                 "system_name": settings.system_name,
-                "muted": settings.muted,
-                "deafened": settings.deafened,
             },
             self.config_path,
         )
@@ -548,6 +652,9 @@ class MainWindow(QMainWindow):
         self.refresh_devices_button.setEnabled(enabled)
         self.ptt_key_edit.setEnabled(enabled)
         self.save_button.setEnabled(enabled)
+        self.start_minimized_checkbox.setEnabled(enabled)
+        self.auto_connect_checkbox.setEnabled(enabled)
+        self.minimize_to_tray_checkbox.setEnabled(enabled)        
 
     def _connect(self) -> None:
         if self.worker_thread is not None:
@@ -582,6 +689,8 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Connecting...")
         self.connect_button.setEnabled(False)
         self.disconnect_button.setEnabled(True)
+        self.connect_action.setEnabled(False)
+        self.disconnect_action.setEnabled(True)        
         self._set_controls_enabled(False)
 
         self.worker_thread.start()
@@ -603,17 +712,24 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Connected")
         self.current_system_label.setText(f"{system_name} ({system_address})")
         self.log(f"Connected: {system_name} ({system_address})")
+        self.tray_icon.setToolTip(f"Voidfarers Voice Client\nConnected: {system_name}")
 
     @Slot()
     def _on_disconnected(self) -> None:
         self.status_label.setText("Disconnected")
         self.connect_button.setEnabled(True)
         self.disconnect_button.setEnabled(False)
+        self.connect_action.setEnabled(True)
+        self.disconnect_action.setEnabled(False)
         self._set_controls_enabled(True)
         self.ptt_status_label.setText("--")
         self.mic_meter.setValue(0)
         self.output_buffer_label.setText("0 ms")
         self.participants_list.clear()
+        self.tray_icon.setToolTip("Voidfarers Voice Client\nDisconnected")
+
+        if self._really_quit:
+            QTimer.singleShot(0, self._force_quit)
 
     @Slot(str, str)
     def _on_system_changed(self, system_name: str, system_address: str) -> None:
@@ -690,7 +806,25 @@ class MainWindow(QMainWindow):
         self.log_output.appendPlainText(message)
 
     def closeEvent(self, event) -> None:
-        if self.worker:
+        minimize_to_tray = True
+
+        if hasattr(self, "minimize_to_tray_checkbox"):
+            minimize_to_tray = self.minimize_to_tray_checkbox.isChecked()
+
+        if minimize_to_tray and not self._really_quit:
+            event.ignore()
+            self.hide()
+
+            if hasattr(self, "tray_icon"):
+                self.tray_icon.showMessage(
+                    "Voidfarers still running",
+                    "The client is still running in the system tray.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000,
+                )
+            return
+
+        if self.worker and not self._really_quit:
             self.worker.request_stop()
             event.ignore()
             QTimer.singleShot(500, self.close)

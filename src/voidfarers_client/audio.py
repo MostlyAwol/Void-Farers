@@ -74,25 +74,46 @@ class AudioEngine:
 
         print("Starting audio devices...")
 
-        self.input_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            blocksize=BLOCKSIZE,
-            channels=NUM_CHANNELS,
-            dtype="int16",
-            device=self.input_device,
-            callback=self._input_callback,
-        )
-        self.input_stream.start()
+        try:
+            self.input_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                blocksize=BLOCKSIZE,
+                channels=NUM_CHANNELS,
+                dtype="int16",
+                device=self.input_device,
+                callback=self._input_callback,
+            )
+            self.input_stream.start()
+        except Exception as exc:
+            self.running = False
+            raise RuntimeError(
+                f"Could not start input audio device {self.input_device!r}. "
+                f"Open Settings > System > Sound, verify the microphone exists, "
+                f"or select a different input device. Details: {exc}"
+            ) from exc
 
-        self.output_stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE,
-            blocksize=BLOCKSIZE,
-            channels=NUM_CHANNELS,
-            dtype="int16",
-            device=self.output_device,
-            callback=self._output_callback,
-        )
-        self.output_stream.start()
+        try:
+            self.output_stream = sd.OutputStream(
+                samplerate=SAMPLE_RATE,
+                blocksize=BLOCKSIZE,
+                channels=NUM_CHANNELS,
+                dtype="int16",
+                device=self.output_device,
+                callback=self._output_callback,
+            )
+            self.output_stream.start()
+        except Exception as exc:
+            if self.input_stream:
+                self.input_stream.stop()
+                self.input_stream.close()
+                self.input_stream = None
+
+            self.running = False
+            raise RuntimeError(
+                f"Could not start output audio device {self.output_device!r}. "
+                f"Open Settings > System > Sound, verify the speaker/headset exists, "
+                f"or select a different output device. Details: {exc}"
+            ) from exc
 
         print("Audio devices started.")
 
