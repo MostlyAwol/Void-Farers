@@ -1,3 +1,6 @@
 requests
 python-dotenv
 livekit
+sounddevice
+numpy
+pynput
