@@ -3,18 +3,13 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from .app_state import SystemState
+
 
 JOURNAL_EVENTS_WITH_SYSTEM = {"Location", "FSDJump", "CarrierJump"}
-
-
-@dataclass(frozen=True)
-class SystemState:
-    system_address: str
-    system_name: str
 
 
 def default_journal_dir() -> Path:
@@ -84,13 +79,6 @@ def watch_system_changes(
     journal_dir: Path,
     poll_seconds: float = 1.0,
 ) -> Iterator[SystemState]:
-    """
-    Polls the newest Elite Dangerous journal file and yields SystemState whenever
-    Location/FSDJump/CarrierJump reports a new system.
-
-    This is intentionally simple for the MVP. Later, we can replace it with
-    watchdog-based file watching.
-    """
     current_file: Path | None = None
     current_pos = 0
     last_state: SystemState | None = None
