@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import queue
 import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import sounddevice as sd
@@ -14,6 +16,7 @@ from livekit import rtc
 from pynput import keyboard
 
 from .backend import request_livekit_token
+from .config import default_config_path, load_config, save_config
 from .journal import SystemState, default_journal_dir, watch_system_changes
 
 
@@ -23,8 +26,12 @@ DEFAULT_SYSTEM_NAME = "Sol"
 
 SAMPLE_RATE = 48000
 NUM_CHANNELS = 1
-FRAME_SAMPLES = 480        # 10 ms at 48 kHz
-BLOCKSIZE = 480            # sounddevice callback size
+FRAME_SAMPLES = 480
+BLOCKSIZE = 480
+
+# Lower = less delay, but more risk of small dropouts.
+# Start with 500ms. If stable, try 250ms later.
+MAX_OUTPUT_BUFFER_SECONDS = 0.5
 
 
 def audioframe_to_bytes(frame: rtc.AudioFrame) -> bytes:
@@ -32,6 +39,17 @@ def audioframe_to_bytes(frame: rtc.AudioFrame) -> bytes:
     if hasattr(data, "tobytes"):
         return data.tobytes()
     return bytes(data)
+
+
+def list_audio_devices() -> None:
+    print(sd.query_devices())
+    print("")
+    print(f"Default input/output device: {sd.default.device}")
+
+
+def config_get(config: dict[str, Any], key: str, fallback: Any) -> Any:
+    value = config.get(key)
+    return fallback if value is None else value
 
 
 class PushToTalk:
@@ -43,11 +61,9 @@ class PushToTalk:
     def _matches(self, key) -> bool:
         wanted = self.key_name
 
-        # Special keys like f12, ctrl_r, alt_r
         if isinstance(key, keyboard.Key):
             return key.name and key.name.lower() == wanted
 
-        # Normal character keys
         if isinstance(key, keyboard.KeyCode) and key.char:
             return key.char.lower() == wanted
 
@@ -100,7 +116,7 @@ class VoiceClient:
 
         self.ptt = PushToTalk(ptt_key)
 
-        self.mic_queue: queue.Queue[rtc.AudioFrame] = queue.Queue(maxsize=200)
+        self.mic_queue: queue.Queue[rtc.AudioFrame] = queue.Queue(maxsize=60)
         self.output_buffer = bytearray()
         self.output_lock = threading.Lock()
 
@@ -108,6 +124,11 @@ class VoiceClient:
         self.output_stream: sd.OutputStream | None = None
 
         self.remote_tasks: set[asyncio.Task] = set()
+
+        self.last_mic_level = 0.0
+        self.last_input_status = ""
+        self.last_output_status = ""
+        self.frames_dropped = 0
 
     def start_audio_devices(self) -> None:
         print("Starting audio devices...")
@@ -147,19 +168,20 @@ class VoiceClient:
 
     def _input_callback(self, indata, frames, time_info, status) -> None:
         if status:
-            print(f"Input status: {status}")
+            self.last_input_status = str(status)
 
         if not self.running:
             return
 
-        # Use silence unless PTT is held.
         if self.ptt.active:
             samples = indata[:, 0].copy()
+            float_samples = samples.astype(np.float32)
+            rms = float(np.sqrt(np.mean(float_samples * float_samples)) / 32768.0)
+            self.last_mic_level = min(1.0, rms)
         else:
             samples = np.zeros(frames, dtype=np.int16)
+            self.last_mic_level = 0.0
 
-        # We expect frames == FRAME_SAMPLES because blocksize is 480.
-        # If Windows/audio driver gives a different size, split safely.
         offset = 0
         while offset < len(samples):
             chunk = samples[offset:offset + FRAME_SAMPLES]
@@ -180,14 +202,13 @@ class VoiceClient:
             try:
                 self.mic_queue.put_nowait(frame)
             except queue.Full:
-                # Drop frames rather than building latency.
-                pass
+                self.frames_dropped += 1
 
     def _output_callback(self, outdata, frames, time_info, status) -> None:
         if status:
-            print(f"Output status: {status}")
+            self.last_output_status = str(status)
 
-        bytes_needed = frames * NUM_CHANNELS * 2  # int16 mono
+        bytes_needed = frames * NUM_CHANNELS * 2
 
         with self.output_lock:
             available = len(self.output_buffer)
@@ -308,10 +329,18 @@ class VoiceClient:
                 with self.output_lock:
                     self.output_buffer.extend(audio_bytes)
 
-                    # Keep buffer bounded to avoid runaway latency.
-                    max_buffer_bytes = SAMPLE_RATE * NUM_CHANNELS * 2 * 2  # 2 seconds
+                    max_buffer_bytes = int(
+                        SAMPLE_RATE
+                        * NUM_CHANNELS
+                        * 2
+                        * MAX_OUTPUT_BUFFER_SECONDS
+                    )
+
+                    # Low-latency behavior:
+                    # if the output buffer grows too large, drop the oldest audio.
                     if len(self.output_buffer) > max_buffer_bytes:
-                        del self.output_buffer[: len(self.output_buffer) - max_buffer_bytes]
+                        overflow = len(self.output_buffer) - max_buffer_bytes
+                        del self.output_buffer[:overflow]
 
         except asyncio.CancelledError:
             pass
@@ -320,13 +349,14 @@ class VoiceClient:
 
     async def mic_publish_loop(self) -> None:
         print("Mic publish loop started.")
+
         while self.running:
             if not self.source:
                 await asyncio.sleep(0.05)
                 continue
 
             try:
-                frame = self.mic_queue.get(timeout=0.1)
+                frame = self.mic_queue.get(timeout=0.05)
             except queue.Empty:
                 await asyncio.sleep(0)
                 continue
@@ -337,13 +367,43 @@ class VoiceClient:
                 print(f"Error publishing mic frame: {exc}")
                 await asyncio.sleep(0.05)
 
+    async def status_loop(self) -> None:
+        while self.running:
+            ptt_state = "TX" if self.ptt.active else "--"
+            level_blocks = int(self.last_mic_level * 20)
+            meter = "#" * level_blocks + "-" * (20 - level_blocks)
+
+            with self.output_lock:
+                out_ms = int(
+                    len(self.output_buffer)
+                    / (SAMPLE_RATE * NUM_CHANNELS * 2)
+                    * 1000
+                )
+
+            system = self.current_state.system_name if self.current_state else "None"
+
+            print(
+                f"\r[{ptt_state}] Mic [{meter}] "
+                f"OutBuf {out_ms:04d}ms "
+                f"Dropped {self.frames_dropped} "
+                f"System {system}      ",
+                end="",
+                flush=True,
+            )
+
+            await asyncio.sleep(0.5)
+
     async def run_static_room(self, state: SystemState) -> None:
+        publish_task: asyncio.Task | None = None
+        status_task: asyncio.Task | None = None
+
         self.ptt.start()
         self.start_audio_devices()
 
         try:
             await self.connect_to_system(state)
             publish_task = asyncio.create_task(self.mic_publish_loop())
+            status_task = asyncio.create_task(self.status_loop())
 
             print("")
             print(f"Hold {self.ptt.key_name.upper()} to talk.")
@@ -355,16 +415,32 @@ class VoiceClient:
 
         finally:
             self.running = False
-            publish_task.cancel()
+
+            if publish_task:
+                publish_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await publish_task
+
+            if status_task:
+                status_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await status_task
+
+            print("")
             self.ptt.stop()
             self.stop_audio_devices()
             await self.disconnect_room()
 
     async def run_with_journal(self, journal_dir: Path) -> None:
+        publish_task: asyncio.Task | None = None
+        status_task: asyncio.Task | None = None
+
         self.ptt.start()
         self.start_audio_devices()
 
         publish_task = asyncio.create_task(self.mic_publish_loop())
+        status_task = asyncio.create_task(self.status_loop())
+
         loop = asyncio.get_running_loop()
         state_queue: asyncio.Queue[SystemState] = asyncio.Queue()
 
@@ -375,7 +451,7 @@ class VoiceClient:
                         break
                     loop.call_soon_threadsafe(state_queue.put_nowait, state)
             except Exception as exc:
-                print(f"Journal watcher error: {exc}")
+                print(f"\nJournal watcher error: {exc}")
 
         thread = threading.Thread(target=watcher_thread, daemon=True)
         thread.start()
@@ -393,11 +469,23 @@ class VoiceClient:
                 if state == self.current_state:
                     continue
 
+                print("")
                 await self.connect_to_system(state)
 
         finally:
             self.running = False
-            publish_task.cancel()
+
+            if publish_task:
+                publish_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await publish_task
+
+            if status_task:
+                status_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await status_task
+
+            print("")
             self.ptt.stop()
             self.stop_audio_devices()
             await self.disconnect_room()
@@ -406,14 +494,14 @@ class VoiceClient:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Voidfarers voice client")
 
-    parser.add_argument("--backend-url", default=DEFAULT_BACKEND_URL)
+    parser.add_argument("--backend-url", default=None)
     parser.add_argument("--client-id", default=None)
-    parser.add_argument("--display-name", default="CMDR Test")
+    parser.add_argument("--display-name", default=None)
 
-    parser.add_argument("--system-address", default=DEFAULT_SYSTEM_ADDRESS)
-    parser.add_argument("--system-name", default=DEFAULT_SYSTEM_NAME)
+    parser.add_argument("--system-address", default=None)
+    parser.add_argument("--system-name", default=None)
 
-    parser.add_argument("--ptt-key", default="f12")
+    parser.add_argument("--ptt-key", default=None)
 
     parser.add_argument("--input-device", type=int, default=None)
     parser.add_argument("--output-device", type=int, default=None)
@@ -425,8 +513,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--journal-dir",
-        default=str(default_journal_dir()),
+        default=None,
         help="Elite Dangerous journal folder",
+    )
+
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="List audio devices and exit",
+    )
+
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Optional config file path",
     )
 
     return parser.parse_args()
@@ -435,29 +535,89 @@ def parse_args() -> argparse.Namespace:
 async def async_main() -> None:
     args = parse_args()
 
-    client_id = args.client_id or f"vf-{uuid.uuid4()}"
+    if args.list_devices:
+        list_audio_devices()
+        return
+
+    config_path = Path(args.config) if args.config else default_config_path()
+    config = load_config(config_path)
+
+    client_id = args.client_id or config_get(config, "client_id", f"vf-{uuid.uuid4()}")
+    display_name = args.display_name or config_get(config, "display_name", "CMDR Test")
+    backend_url = args.backend_url or config_get(config, "backend_url", DEFAULT_BACKEND_URL)
+
+    ptt_key = args.ptt_key or config_get(config, "ptt_key", "f12")
+
+    input_device = (
+        args.input_device
+        if args.input_device is not None
+        else config.get("input_device")
+    )
+
+    output_device = (
+        args.output_device
+        if args.output_device is not None
+        else config.get("output_device")
+    )
+
+    journal_dir = Path(
+        args.journal_dir
+        or config_get(config, "journal_dir", str(default_journal_dir()))
+    )
+
+    system_address = args.system_address or config_get(
+        config,
+        "system_address",
+        DEFAULT_SYSTEM_ADDRESS,
+    )
+
+    system_name = args.system_name or config_get(
+        config,
+        "system_name",
+        DEFAULT_SYSTEM_NAME,
+    )
+
+    # Save resolved settings so future runs do not need repeated args.
+    save_config(
+        {
+            "client_id": client_id,
+            "display_name": display_name,
+            "backend_url": backend_url,
+            "ptt_key": ptt_key,
+            "input_device": input_device,
+            "output_device": output_device,
+            "journal_dir": str(journal_dir),
+            "system_address": str(system_address),
+            "system_name": str(system_name),
+        },
+        config_path,
+    )
+
+    print(f"Using config: {config_path}")
+    print(f"Display name: {display_name}")
+    print(f"Client ID: {client_id}")
 
     client = VoiceClient(
-        backend_url=args.backend_url,
+        backend_url=backend_url,
         client_id=client_id,
-        display_name=args.display_name,
-        ptt_key=args.ptt_key,
-        input_device=args.input_device,
-        output_device=args.output_device,
+        display_name=display_name,
+        ptt_key=ptt_key,
+        input_device=input_device,
+        output_device=output_device,
     )
 
     try:
         if args.journal:
-            await client.run_with_journal(Path(args.journal_dir))
+            await client.run_with_journal(journal_dir)
         else:
             await client.run_static_room(
                 SystemState(
-                    system_address=str(args.system_address),
-                    system_name=str(args.system_name),
+                    system_address=str(system_address),
+                    system_name=str(system_name),
                 )
             )
     except KeyboardInterrupt:
-        print("Exiting...")
+        print("\nExiting...")
         client.running = False
 
 
