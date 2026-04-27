@@ -72,7 +72,7 @@ class AudioEngine:
     def start(self) -> None:
         self.running = True
 
-        print("Starting audio devices...")
+        #print("Starting audio devices...")
 
         try:
             self.input_stream = sd.InputStream(
@@ -115,7 +115,7 @@ class AudioEngine:
                 f"or select a different output device. Details: {exc}"
             ) from exc
 
-        print("Audio devices started.")
+        #print("Audio devices started.")
 
     def stop(self) -> None:
         self.running = False

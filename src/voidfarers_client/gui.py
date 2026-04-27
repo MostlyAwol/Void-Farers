@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 import asyncio
 import contextlib
 import threading
@@ -46,11 +48,9 @@ from .journal import default_journal_dir, watch_system_changes
 from .ptt import PushToTalk
 from .voice import VoiceClient
 
-
 def config_get(config: dict[str, Any], key: str, fallback: Any) -> Any:
     value = config.get(key)
     return fallback if value is None else value
-
 
 def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     input_devices: list[tuple[int, str]] = []
@@ -73,6 +73,13 @@ def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
 
     return input_devices, output_devices
 
+def resource_path(relative_path: str) -> Path:
+    """
+    Works in dev and in PyInstaller one-file/one-folder builds.
+    """
+    if hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / relative_path
+    return Path(__file__).resolve().parents[2] / relative_path
 
 class VoiceWorker(QObject):
     log = Signal(str)
@@ -302,8 +309,15 @@ class MainWindow(QMainWindow):
     def _setup_tray(self) -> None:
         self.tray_icon = QSystemTrayIcon(self)
 
-        # Uses a built-in generic icon for now. We can replace with a real app icon later.
-        icon = self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon)
+        icon_path = resource_path("assets/voidfarers.ico")
+
+        if icon_path.exists():
+            icon = QIcon(str(icon_path))
+            self.log(f"Loaded icon: {icon_path}")
+        else:
+            icon = self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon)
+            self.log(f"Icon not found, using fallback: {icon_path}")
+
         self.tray_icon.setIcon(icon)
         self.setWindowIcon(icon)
 
