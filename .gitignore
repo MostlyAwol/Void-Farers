@@ -226,3 +226,4 @@ config.local.json
 dist/
 build/
 *.spec
+build cmd.txt

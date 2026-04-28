@@ -1,4 +1,4 @@
-Voidfarers Voice Client - Beta 0.1 MVP edition
+Voidfarers Voice Client - Beta 1.01 MVP edition
 
 Requirements:
 - Windows 10/11
@@ -27,3 +27,5 @@ Beta Feedback Wanted:
 - Could you hear another tester?
 - Did journal mode switch rooms correctly?
 - Any crashes, delays, or audio glitches?
+
+Voidfarers does not require email addresses or collect unnecessary personal information. Identity verification, when enabled, is based on Frontier authentication and is used only to verify commander identity, prevent abuse, and operate the voice service.

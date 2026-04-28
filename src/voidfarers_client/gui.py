@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 import asyncio
 import contextlib
+import sys
 import threading
 import uuid
 from pathlib import Path
 from typing import Any
 
 import sounddevice as sd
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,9 +47,11 @@ from .journal import default_journal_dir, watch_system_changes
 from .ptt import PushToTalk
 from .voice import VoiceClient
 
+
 def config_get(config: dict[str, Any], key: str, fallback: Any) -> Any:
     value = config.get(key)
     return fallback if value is None else value
+
 
 def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     input_devices: list[tuple[int, str]] = []
@@ -73,6 +74,7 @@ def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
 
     return input_devices, output_devices
 
+
 def resource_path(relative_path: str) -> Path:
     """
     Works in dev and in PyInstaller one-file/one-folder builds.
@@ -80,6 +82,7 @@ def resource_path(relative_path: str) -> Path:
     if hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS) / relative_path
     return Path(__file__).resolve().parents[2] / relative_path
+
 
 class VoiceWorker(QObject):
     log = Signal(str)
@@ -275,12 +278,14 @@ class VoiceWorker(QObject):
 
         self.participants_snapshot.emit(participants)
 
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
         self.setWindowTitle("Voidfarers Voice Client")
-        self.resize(850, 650)
+        self.resize(760, 650)
+        self.setMinimumSize(760, 480)
 
         self.config_path = default_config_path()
         self.config = load_config(self.config_path)
@@ -384,13 +389,20 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         root = QWidget()
         root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(10, 8, 10, 8)
+        root_layout.setSpacing(8)
 
         self.status_label = QLabel("Disconnected")
         self.status_label.setStyleSheet("font-weight: bold;")
         root_layout.addWidget(self.status_label)
 
+        # Row 1: Identity left, Participants right.
+        top_row = QHBoxLayout()
+        top_row.setSpacing(8)
+
         identity_box = QGroupBox("Identity")
         identity_layout = QFormLayout(identity_box)
+        identity_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self.display_name_edit = QLineEdit()
         self.client_id_edit = QLineEdit()
@@ -401,24 +413,44 @@ class MainWindow(QMainWindow):
         identity_layout.addRow("Client ID:", self.client_id_edit)
         identity_layout.addRow("Backend URL:", self.backend_url_edit)
 
-        root_layout.addWidget(identity_box)
+        participants_box = QGroupBox("Participants")
+        participants_layout = QVBoxLayout(participants_box)
+        participants_layout.setContentsMargins(8, 8, 8, 8)
 
+        self.participants_list = QListWidget()
+        self.participants_list.setMinimumHeight(75)
+        participants_layout.addWidget(self.participants_list)
+
+        top_row.addWidget(identity_box, 1)
+        top_row.addWidget(participants_box, 1)
+
+        root_layout.addLayout(top_row)
+
+        # Row 2: Mode full width.
         mode_box = QGroupBox("Mode")
         mode_layout = QVBoxLayout(mode_box)
+        mode_layout.setSpacing(6)
 
+        mode_radio_layout = QHBoxLayout()
         self.static_radio = QRadioButton("Static test room")
         self.journal_radio = QRadioButton("Elite Dangerous journal mode")
         self.static_radio.setChecked(True)
 
-        mode_layout.addWidget(self.static_radio)
-        mode_layout.addWidget(self.journal_radio)
+        mode_radio_layout.addWidget(self.static_radio)
+        mode_radio_layout.addWidget(self.journal_radio)
+        mode_radio_layout.addStretch()
 
-        static_layout = QFormLayout()
+        mode_layout.addLayout(mode_radio_layout)
+
+        static_layout = QHBoxLayout()
         self.system_name_edit = QLineEdit()
         self.system_address_edit = QLineEdit()
 
-        static_layout.addRow("System name:", self.system_name_edit)
-        static_layout.addRow("System address:", self.system_address_edit)
+        static_layout.addWidget(QLabel("System name:"))
+        static_layout.addWidget(self.system_name_edit, 1)
+        static_layout.addWidget(QLabel("System address:"))
+        static_layout.addWidget(self.system_address_edit, 1)
+
         mode_layout.addLayout(static_layout)
 
         journal_layout = QHBoxLayout()
@@ -426,16 +458,21 @@ class MainWindow(QMainWindow):
         self.browse_journal_button = QPushButton("Browse...")
         self.browse_journal_button.clicked.connect(self._browse_journal_dir)
 
-        journal_layout.addWidget(self.journal_dir_edit)
+        journal_layout.addWidget(QLabel("Journal folder:"))
+        journal_layout.addWidget(self.journal_dir_edit, 1)
         journal_layout.addWidget(self.browse_journal_button)
 
-        mode_layout.addWidget(QLabel("Journal folder:"))
         mode_layout.addLayout(journal_layout)
 
         root_layout.addWidget(mode_box)
 
+        # Row 3: Audio left 75%, Startup / Tray right 25%.
+        audio_startup_row = QHBoxLayout()
+        audio_startup_row.setSpacing(8)
+
         audio_box = QGroupBox("Audio")
         audio_layout = QFormLayout(audio_box)
+        audio_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self.input_device_combo = QComboBox()
         self.output_device_combo = QComboBox()
@@ -450,33 +487,42 @@ class MainWindow(QMainWindow):
 
         audio_layout.addRow("Input device:", self.input_device_combo)
         audio_layout.addRow("Output device:", self.output_device_combo)
-        audio_layout.addRow("", self.refresh_devices_button)
-        audio_layout.addRow("PTT key:", self.ptt_key_edit)
-        audio_layout.addRow("", self.mute_checkbox)
-        audio_layout.addRow("", self.deafen_checkbox)
+
+        audio_controls_row = QHBoxLayout()
+        audio_controls_row.addWidget(QLabel("PTT key:"))
+        audio_controls_row.addWidget(self.ptt_key_edit)
+        audio_controls_row.addWidget(self.refresh_devices_button)
+        audio_controls_row.addWidget(self.mute_checkbox)
+        audio_controls_row.addWidget(self.deafen_checkbox)
+
+        audio_layout.addRow("", audio_controls_row)
 
         self.mute_checkbox.toggled.connect(self._on_mute_toggled)
         self.deafen_checkbox.toggled.connect(self._on_deafen_toggled)
 
-        root_layout.addWidget(audio_box)
-
         startup_box = QGroupBox("Startup / Tray")
         startup_layout = QVBoxLayout(startup_box)
+        startup_layout.setSpacing(6)
 
         self.start_minimized_checkbox = QCheckBox("Start minimized")
-        self.auto_connect_checkbox = QCheckBox("Auto-connect on launch")
-        self.minimize_to_tray_checkbox = QCheckBox("Minimize/close to tray")
+        self.auto_connect_checkbox = QCheckBox("Auto-connect")
+        self.minimize_to_tray_checkbox = QCheckBox("Close to tray")
         self.minimize_to_tray_checkbox.setChecked(True)
 
         startup_layout.addWidget(self.start_minimized_checkbox)
         startup_layout.addWidget(self.auto_connect_checkbox)
         startup_layout.addWidget(self.minimize_to_tray_checkbox)
+        startup_layout.addStretch()
 
-        root_layout.addWidget(startup_box)
+        audio_startup_row.addWidget(audio_box, 3)
+        audio_startup_row.addWidget(startup_box, 1)
 
+        root_layout.addLayout(audio_startup_row)
 
+        # Row 4: Live Status full width, compact horizontal layout.
         status_box = QGroupBox("Live Status")
-        status_layout = QFormLayout(status_box)
+        status_layout = QHBoxLayout(status_box)
+        status_layout.setSpacing(8)
 
         self.current_system_label = QLabel("None")
         self.ptt_status_label = QLabel("--")
@@ -487,15 +533,22 @@ class MainWindow(QMainWindow):
         self.mic_meter.setRange(0, 100)
         self.mic_meter.setValue(0)
         self.mic_meter.setTextVisible(True)
+        self.mic_meter.setMaximumWidth(180)
 
-        status_layout.addRow("Current system:", self.current_system_label)
-        status_layout.addRow("PTT:", self.ptt_status_label)
-        status_layout.addRow("Mic level:", self.mic_meter)
-        status_layout.addRow("Output buffer:", self.output_buffer_label)
-        status_layout.addRow("Dropped frames:", self.dropped_label)
+        status_layout.addWidget(QLabel("System:"))
+        status_layout.addWidget(self.current_system_label, 2)
+        status_layout.addWidget(QLabel("PTT:"))
+        status_layout.addWidget(self.ptt_status_label)
+        status_layout.addWidget(QLabel("Mic:"))
+        status_layout.addWidget(self.mic_meter)
+        status_layout.addWidget(QLabel("Buffer:"))
+        status_layout.addWidget(self.output_buffer_label)
+        status_layout.addWidget(QLabel("Dropped:"))
+        status_layout.addWidget(self.dropped_label)
 
         root_layout.addWidget(status_box)
 
+        # Row 5: Action buttons.
         buttons_layout = QHBoxLayout()
         self.connect_button = QPushButton("Connect")
         self.disconnect_button = QPushButton("Disconnect")
@@ -507,14 +560,6 @@ class MainWindow(QMainWindow):
         self.disconnect_button.clicked.connect(self._disconnect)
         self.save_button.clicked.connect(self._save_settings_from_ui)
 
-        participants_box = QGroupBox("Participants")
-        participants_layout = QVBoxLayout(participants_box)
-
-        self.participants_list = QListWidget()
-        participants_layout.addWidget(self.participants_list)
-
-        root_layout.addWidget(participants_box)
-
         buttons_layout.addWidget(self.connect_button)
         buttons_layout.addWidget(self.disconnect_button)
         buttons_layout.addStretch()
@@ -522,9 +567,12 @@ class MainWindow(QMainWindow):
 
         root_layout.addLayout(buttons_layout)
 
+        # Row 6: Log.
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setMaximumBlockCount(1000)
+        self.log_output.setMinimumHeight(95)
+
         root_layout.addWidget(QLabel("Log:"))
         root_layout.addWidget(self.log_output, stretch=1)
 
@@ -537,20 +585,32 @@ class MainWindow(QMainWindow):
         self.display_name_edit.setText(str(display_name))
         self.client_id_edit.setText(str(client_id))
 
-        self.system_name_edit.setText(str(config_get(self.config, "system_name", DEFAULT_SYSTEM_NAME)))
-        self.system_address_edit.setText(str(config_get(self.config, "system_address", DEFAULT_SYSTEM_ADDRESS)))
+        self.system_name_edit.setText(
+            str(config_get(self.config, "system_name", DEFAULT_SYSTEM_NAME))
+        )
+        self.system_address_edit.setText(
+            str(config_get(self.config, "system_address", DEFAULT_SYSTEM_ADDRESS))
+        )
 
         self.ptt_key_edit.setText(str(config_get(self.config, "ptt_key", "f12")))
 
         journal_dir = config_get(self.config, "journal_dir", str(default_journal_dir()))
         self.journal_dir_edit.setText(str(journal_dir))
-        self.backend_url_edit.setText(str(config_get(self.config, "backend_url", DEFAULT_BACKEND_URL)))
+        self.backend_url_edit.setText(
+            str(config_get(self.config, "backend_url", DEFAULT_BACKEND_URL))
+        )
         self.mute_checkbox.setChecked(bool(config_get(self.config, "muted", False)))
         self.deafen_checkbox.setChecked(bool(config_get(self.config, "deafened", False)))
 
-        self.start_minimized_checkbox.setChecked(bool(config_get(self.config, "start_minimized", False)))
-        self.auto_connect_checkbox.setChecked(bool(config_get(self.config, "auto_connect", False)))
-        self.minimize_to_tray_checkbox.setChecked(bool(config_get(self.config, "minimize_to_tray", True)))        
+        self.start_minimized_checkbox.setChecked(
+            bool(config_get(self.config, "start_minimized", False))
+        )
+        self.auto_connect_checkbox.setChecked(
+            bool(config_get(self.config, "auto_connect", False))
+        )
+        self.minimize_to_tray_checkbox.setChecked(
+            bool(config_get(self.config, "minimize_to_tray", True))
+        )
 
     def _populate_audio_devices(self) -> None:
         saved_input = self.config.get("input_device")
@@ -590,7 +650,11 @@ class MainWindow(QMainWindow):
 
     def _browse_journal_dir(self) -> None:
         start_dir = self.journal_dir_edit.text().strip() or str(default_journal_dir())
-        chosen = QFileDialog.getExistingDirectory(self, "Select Elite Dangerous Journal Folder", start_dir)
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "Select Elite Dangerous Journal Folder",
+            start_dir,
+        )
 
         if chosen:
             self.journal_dir_edit.setText(chosen)
@@ -605,8 +669,6 @@ class MainWindow(QMainWindow):
 
         journal_dir_text = self.journal_dir_edit.text().strip()
         journal_dir = Path(journal_dir_text) if journal_dir_text else default_journal_dir()
-        muted=self.mute_checkbox.isChecked(),
-        deafened=self.deafen_checkbox.isChecked(),
 
         return ClientSettings(
             backend_url=self.backend_url_edit.text().strip() or DEFAULT_BACKEND_URL,
@@ -668,7 +730,7 @@ class MainWindow(QMainWindow):
         self.save_button.setEnabled(enabled)
         self.start_minimized_checkbox.setEnabled(enabled)
         self.auto_connect_checkbox.setEnabled(enabled)
-        self.minimize_to_tray_checkbox.setEnabled(enabled)        
+        self.minimize_to_tray_checkbox.setEnabled(enabled)
 
     def _connect(self) -> None:
         if self.worker_thread is not None:
@@ -704,7 +766,7 @@ class MainWindow(QMainWindow):
         self.connect_button.setEnabled(False)
         self.disconnect_button.setEnabled(True)
         self.connect_action.setEnabled(False)
-        self.disconnect_action.setEnabled(True)        
+        self.disconnect_action.setEnabled(True)
         self._set_controls_enabled(False)
 
         self.worker_thread.start()
@@ -783,7 +845,13 @@ class MainWindow(QMainWindow):
             self.participants_list.addItem("No other participants")
 
     @Slot(bool, float, int, int)
-    def _on_stats(self, ptt_active: bool, mic_level: float, output_ms: int, dropped: int) -> None:
+    def _on_stats(
+        self,
+        ptt_active: bool,
+        mic_level: float,
+        output_ms: int,
+        dropped: int,
+    ) -> None:
         self.ptt_status_label.setText("TX" if ptt_active else "--")
         self.mic_meter.setValue(int(max(0.0, min(1.0, mic_level)) * 100))
         self.output_buffer_label.setText(f"{output_ms} ms")
