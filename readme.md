@@ -33,7 +33,7 @@ Beta Feedback Wanted:
 
 ##Backend Overview
 
-Void Farers uses LiveKit as the backend voice service. [LiveKit](https://livekit.com/) provides the WebRTC infrastructure used to connect commanders together in real time. 
+Void Farers uses LiveKit as the backend voice service. [LiveKit](https://github.com/livekit/livekit) provides the WebRTC infrastructure used to connect commanders together in real time. 
 
 The backend uses LiveKit rooms as the voice channels. A room represents a shared voice space, such as a specific star system and private group. Clients connected to the same room can hear each other, while clients in different rooms are kept separate. Rooms are based on the commander’s current Elite Dangerous context. When a client detects that the player is in a system, it requests access to the matching voice room. Commanders in the same system can then be placed into the same LiveKit room so they can speak with each other.
 
