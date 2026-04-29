@@ -1,4 +1,5 @@
 Voidfarers Voice Client - Beta 1.01 MVP edition
+Download the [Latest Release](https://github.com/MostlyAwol/Void-Farers/releases/latest)
 
 Requirements:
 - Windows 10/11
