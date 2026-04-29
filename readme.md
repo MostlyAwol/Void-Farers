@@ -31,7 +31,7 @@ Beta Feedback Wanted:
 - Did journal mode switch rooms correctly?
 - Any crashes, delays, or audio glitches?
 
-##Backend Overview
+## Backend Overview
 
 Void Farers uses LiveKit as the backend voice service. [LiveKit](https://github.com/livekit/livekit) provides the WebRTC infrastructure used to connect commanders together in real time. 
 
