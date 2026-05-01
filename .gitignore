@@ -227,3 +227,4 @@ dist/
 build/
 *.spec
 build cmd.txt
+backend/

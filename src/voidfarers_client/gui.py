@@ -8,13 +8,15 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import sounddevice as sd
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QIcon
-from PySide6.QtWidgets import (
+import sounddevice as sd # type: ignore
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot # type: ignore
+from PySide6.QtGui import QAction, QIcon # type: ignore
+from PySide6.QtWidgets import ( # type: ignore
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -24,6 +26,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QMainWindow,
     QMenu,
+    QMenuBar,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
@@ -43,7 +46,7 @@ from .app_state import (
 )
 from .audio import AudioEngine
 from .config import default_config_path, load_config, save_config
-from .journal import default_journal_dir, watch_system_changes
+from .journal import default_journal_dir, read_last_commander_name, watch_system_changes
 from .ptt import PushToTalk
 from .voice import VoiceClient
 
@@ -76,12 +79,84 @@ def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
 
 
 def resource_path(relative_path: str) -> Path:
-    """
-    Works in dev and in PyInstaller one-file/one-folder builds.
-    """
     if hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS) / relative_path
     return Path(__file__).resolve().parents[2] / relative_path
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent: "MainWindow") -> None:
+        super().__init__(parent)
+
+        self.parent_window = parent
+        self.setWindowTitle("Voidfarers Settings")
+        self.resize(520, 260)
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        self.client_id_edit = QLineEdit(parent.client_id)
+        self.client_id_edit.setPlaceholderText("Generated automatically if empty")
+
+        self.backend_url_edit = QLineEdit(parent.backend_url)
+
+        self.journal_dir_edit = QLineEdit(str(parent.journal_dir))
+        self.browse_button = QPushButton("Browse...")
+        self.browse_button.clicked.connect(self._browse_journal_dir)
+
+        journal_row = QHBoxLayout()
+        journal_row.addWidget(self.journal_dir_edit, 1)
+        journal_row.addWidget(self.browse_button)
+
+        self.start_minimized_checkbox = QCheckBox("Start minimized")
+        self.start_minimized_checkbox.setChecked(parent.start_minimized)
+
+        self.auto_connect_checkbox = QCheckBox("Auto-connect on launch")
+        self.auto_connect_checkbox.setChecked(parent.auto_connect)
+
+        self.minimize_to_tray_checkbox = QCheckBox("Minimize/close to tray")
+        self.minimize_to_tray_checkbox.setChecked(parent.minimize_to_tray)
+
+        form.addRow("Client ID:", self.client_id_edit)
+        form.addRow("Backend URL:", self.backend_url_edit)
+        form.addRow("Journal folder:", journal_row)
+        form.addRow("", self.start_minimized_checkbox)
+        form.addRow("", self.auto_connect_checkbox)
+        form.addRow("", self.minimize_to_tray_checkbox)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout.addWidget(buttons)
+
+    def _browse_journal_dir(self) -> None:
+        start_dir = self.journal_dir_edit.text().strip() or str(default_journal_dir())
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "Select Elite Dangerous Journal Folder",
+            start_dir,
+        )
+
+        if chosen:
+            self.journal_dir_edit.setText(chosen)
+
+    def values(self) -> dict[str, Any]:
+        return {
+            "client_id": self.client_id_edit.text().strip(),
+            "backend_url": self.backend_url_edit.text().strip() or DEFAULT_BACKEND_URL,
+            "journal_dir": self.journal_dir_edit.text().strip() or str(default_journal_dir()),
+            "start_minimized": self.start_minimized_checkbox.isChecked(),
+            "auto_connect": self.auto_connect_checkbox.isChecked(),
+            "minimize_to_tray": self.minimize_to_tray_checkbox.isChecked(),
+        }
 
 
 class VoiceWorker(QObject):
@@ -89,7 +164,9 @@ class VoiceWorker(QObject):
     error = Signal(str)
     connected = Signal(str, str)
     disconnected = Signal()
+    skipped_connection = Signal(str)
     system_changed = Signal(str, str)
+    commander_detected = Signal(str)
     participant_joined = Signal(str, str)
     participant_left = Signal(str, str)
     participants_snapshot = Signal(list)
@@ -184,10 +261,12 @@ class VoiceWorker(QObject):
                 state = SystemState(
                     system_address=self.settings.system_address,
                     system_name=self.settings.system_name,
+                    game_mode=self.settings.game_mode or "Open",
+                    group=self.settings.group or "",
+                    commander_name=self.settings.display_name,
+                    in_game=True,
                 )
-                await self.voice.connect_to_system(state)
-                self.connected.emit(state.system_name, state.system_address)
-                self.emit_participants_snapshot()
+                await self._connect_or_skip(state)
 
                 while self.voice.running and not self._stop_requested:
                     await asyncio.sleep(0.2)
@@ -225,9 +304,34 @@ class VoiceWorker(QObject):
             if state == self.voice.current_state:
                 continue
 
-            await self.voice.connect_to_system(state)
-            self.connected.emit(state.system_name, state.system_address)
-            self.emit_participants_snapshot()
+            await self._connect_or_skip(state)
+
+    async def _connect_or_skip(self, state: SystemState) -> None:
+        assert self.voice is not None
+
+        if state.commander_name:
+            self.commander_detected.emit(state.commander_name)
+
+            if self.voice.display_name in {"", "CMDR Test"}:
+                self.voice.display_name = state.commander_name
+
+        self.system_changed.emit(state.system_name, state.system_address)
+
+        if not state.in_game:
+            if self.voice.room:
+                await self.voice.disconnect_room()
+            self.skipped_connection.emit("Waiting for active Elite Dangerous session...")
+            return
+
+        if state.is_solo:
+            if self.voice.room:
+                await self.voice.disconnect_room()
+            self.skipped_connection.emit("Solo mode detected. Voice is not connected.")
+            return
+
+        await self.voice.connect_to_system(state)
+        self.connected.emit(state.system_name, state.system_address)
+        self.emit_participants_snapshot()
 
     async def _stats_loop(self) -> None:
         while not self._stop_requested:
@@ -284,8 +388,8 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Voidfarers Voice Client")
-        self.resize(760, 650)
-        self.setMinimumSize(760, 480)
+        self.resize(720, 620)
+        self.setMinimumSize(720, 460)
 
         self.config_path = default_config_path()
         self.config = load_config(self.config_path)
@@ -297,19 +401,46 @@ class MainWindow(QMainWindow):
         self.input_devices: list[tuple[int, str]] = []
         self.output_devices: list[tuple[int, str]] = []
 
+        self.client_id = str(config_get(self.config, "client_id", f"vf-{uuid.uuid4()}"))
+        self.backend_url = str(config_get(self.config, "backend_url", DEFAULT_BACKEND_URL))
+        self.journal_dir = Path(
+            str(config_get(self.config, "journal_dir", str(default_journal_dir())))
+        )
+        self.start_minimized = bool(config_get(self.config, "start_minimized", False))
+        self.auto_connect = bool(config_get(self.config, "auto_connect", False))
+        self.minimize_to_tray = bool(config_get(self.config, "minimize_to_tray", True))
+
+        self._build_menu()
         self._build_ui()
         self._load_settings_into_ui()
         self._populate_audio_devices()
         self._setup_tray()
+        self._try_apply_commander_name_from_journal()
 
-        if bool(config_get(self.config, "start_minimized", False)):
+        if self.start_minimized:
             QTimer.singleShot(0, self.hide)
 
-        if bool(config_get(self.config, "auto_connect", False)):
+        if self.auto_connect:
             QTimer.singleShot(500, self._connect)
 
         self.stats_timer = QTimer(self)
         self.stats_timer.setInterval(1000)
+
+    def _build_menu(self) -> None:
+        menu_bar = QMenuBar(self)
+        self.setMenuBar(menu_bar)
+
+        app_menu = menu_bar.addMenu("Voidfarers")
+
+        self.settings_action = QAction("Settings...", self)
+        self.settings_action.triggered.connect(self._open_settings_dialog)
+        app_menu.addAction(self.settings_action)
+
+        app_menu.addSeparator()
+
+        self.quit_menu_action = QAction("Quit", self)
+        self.quit_menu_action.triggered.connect(self._quit_from_tray)
+        app_menu.addAction(self.quit_menu_action)
 
     def _setup_tray(self) -> None:
         self.tray_icon = QSystemTrayIcon(self)
@@ -366,8 +497,6 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.status_label.setText("Quitting...")
             self.worker.request_stop()
-
-            # Give the worker a moment to disconnect cleanly, then force the app exit path.
             QTimer.singleShot(1000, self._force_quit)
         else:
             self._force_quit()
@@ -396,7 +525,6 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("font-weight: bold;")
         root_layout.addWidget(self.status_label)
 
-        # Row 1: Identity left, Participants right.
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
 
@@ -405,20 +533,18 @@ class MainWindow(QMainWindow):
         identity_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self.display_name_edit = QLineEdit()
-        self.client_id_edit = QLineEdit()
-        self.client_id_edit.setPlaceholderText("Generated automatically if empty")
-        self.backend_url_edit = QLineEdit()
+        self.client_id_label = QLabel(self.client_id)
+        self.client_id_label.setTextInteractionFlags(self.client_id_label.textInteractionFlags())
 
-        identity_layout.addRow("Display name:", self.display_name_edit)
-        identity_layout.addRow("Client ID:", self.client_id_edit)
-        identity_layout.addRow("Backend URL:", self.backend_url_edit)
+        identity_layout.addRow("Display Name:", self.display_name_edit)
+        identity_layout.addRow("Client ID:", self.client_id_label)
 
         participants_box = QGroupBox("Participants")
         participants_layout = QVBoxLayout(participants_box)
         participants_layout.setContentsMargins(8, 8, 8, 8)
 
         self.participants_list = QListWidget()
-        self.participants_list.setMinimumHeight(75)
+        self.participants_list.setMinimumHeight(70)
         participants_layout.addWidget(self.participants_list)
 
         top_row.addWidget(identity_box, 1)
@@ -426,7 +552,6 @@ class MainWindow(QMainWindow):
 
         root_layout.addLayout(top_row)
 
-        # Row 2: Mode full width.
         mode_box = QGroupBox("Mode")
         mode_layout = QVBoxLayout(mode_box)
         mode_layout.setSpacing(6)
@@ -445,30 +570,30 @@ class MainWindow(QMainWindow):
         static_layout = QHBoxLayout()
         self.system_name_edit = QLineEdit()
         self.system_address_edit = QLineEdit()
+        self.game_mode_combo = QComboBox()
+        self.game_mode_combo.addItems(["Open", "Group", "Solo"])
+        self.group_name_edit = QLineEdit()
+        self.group_name_edit.setPlaceholderText("Group name")
 
-        static_layout.addWidget(QLabel("System name:"))
+        static_layout.addWidget(QLabel("System:"))
         static_layout.addWidget(self.system_name_edit, 1)
-        static_layout.addWidget(QLabel("System address:"))
+        static_layout.addWidget(QLabel("ID:"))
         static_layout.addWidget(self.system_address_edit, 1)
+        static_layout.addWidget(QLabel("Mode:"))
+        static_layout.addWidget(self.game_mode_combo)
+        static_layout.addWidget(self.group_name_edit, 1)
 
         mode_layout.addLayout(static_layout)
 
-        journal_layout = QHBoxLayout()
-        self.journal_dir_edit = QLineEdit()
-        self.browse_journal_button = QPushButton("Browse...")
-        self.browse_journal_button.clicked.connect(self._browse_journal_dir)
+        journal_info_row = QHBoxLayout()
+        self.journal_dir_label = QLabel(str(self.journal_dir))
+        self.journal_dir_label.setWordWrap(True)
+        journal_info_row.addWidget(QLabel("Journal:"))
+        journal_info_row.addWidget(self.journal_dir_label, 1)
 
-        journal_layout.addWidget(QLabel("Journal folder:"))
-        journal_layout.addWidget(self.journal_dir_edit, 1)
-        journal_layout.addWidget(self.browse_journal_button)
-
-        mode_layout.addLayout(journal_layout)
+        mode_layout.addLayout(journal_info_row)
 
         root_layout.addWidget(mode_box)
-
-        # Row 3: Audio left 75%, Startup / Tray right 25%.
-        audio_startup_row = QHBoxLayout()
-        audio_startup_row.setSpacing(8)
 
         audio_box = QGroupBox("Audio")
         audio_layout = QFormLayout(audio_box)
@@ -485,11 +610,11 @@ class MainWindow(QMainWindow):
         self.mute_checkbox = QCheckBox("Mute microphone")
         self.deafen_checkbox = QCheckBox("Deafen output")
 
-        audio_layout.addRow("Input device:", self.input_device_combo)
-        audio_layout.addRow("Output device:", self.output_device_combo)
+        audio_layout.addRow("Input:", self.input_device_combo)
+        audio_layout.addRow("Output:", self.output_device_combo)
 
         audio_controls_row = QHBoxLayout()
-        audio_controls_row.addWidget(QLabel("PTT key:"))
+        audio_controls_row.addWidget(QLabel("PTT:"))
         audio_controls_row.addWidget(self.ptt_key_edit)
         audio_controls_row.addWidget(self.refresh_devices_button)
         audio_controls_row.addWidget(self.mute_checkbox)
@@ -500,31 +625,14 @@ class MainWindow(QMainWindow):
         self.mute_checkbox.toggled.connect(self._on_mute_toggled)
         self.deafen_checkbox.toggled.connect(self._on_deafen_toggled)
 
-        startup_box = QGroupBox("Startup / Tray")
-        startup_layout = QVBoxLayout(startup_box)
-        startup_layout.setSpacing(6)
+        root_layout.addWidget(audio_box)
 
-        self.start_minimized_checkbox = QCheckBox("Start minimized")
-        self.auto_connect_checkbox = QCheckBox("Auto-connect")
-        self.minimize_to_tray_checkbox = QCheckBox("Close to tray")
-        self.minimize_to_tray_checkbox.setChecked(True)
-
-        startup_layout.addWidget(self.start_minimized_checkbox)
-        startup_layout.addWidget(self.auto_connect_checkbox)
-        startup_layout.addWidget(self.minimize_to_tray_checkbox)
-        startup_layout.addStretch()
-
-        audio_startup_row.addWidget(audio_box, 3)
-        audio_startup_row.addWidget(startup_box, 1)
-
-        root_layout.addLayout(audio_startup_row)
-
-        # Row 4: Live Status full width, compact horizontal layout.
         status_box = QGroupBox("Live Status")
         status_layout = QHBoxLayout(status_box)
         status_layout.setSpacing(8)
 
         self.current_system_label = QLabel("None")
+        self.current_room_label = QLabel("None")
         self.ptt_status_label = QLabel("--")
         self.output_buffer_label = QLabel("0 ms")
         self.dropped_label = QLabel("0")
@@ -533,26 +641,27 @@ class MainWindow(QMainWindow):
         self.mic_meter.setRange(0, 100)
         self.mic_meter.setValue(0)
         self.mic_meter.setTextVisible(True)
-        self.mic_meter.setMaximumWidth(180)
+        self.mic_meter.setMaximumWidth(150)
 
         status_layout.addWidget(QLabel("System:"))
         status_layout.addWidget(self.current_system_label, 2)
+        status_layout.addWidget(QLabel("Room:"))
+        status_layout.addWidget(self.current_room_label, 2)
         status_layout.addWidget(QLabel("PTT:"))
         status_layout.addWidget(self.ptt_status_label)
         status_layout.addWidget(QLabel("Mic:"))
         status_layout.addWidget(self.mic_meter)
-        status_layout.addWidget(QLabel("Buffer:"))
+        status_layout.addWidget(QLabel("Buf:"))
         status_layout.addWidget(self.output_buffer_label)
-        status_layout.addWidget(QLabel("Dropped:"))
+        status_layout.addWidget(QLabel("Drop:"))
         status_layout.addWidget(self.dropped_label)
 
         root_layout.addWidget(status_box)
 
-        # Row 5: Action buttons.
         buttons_layout = QHBoxLayout()
         self.connect_button = QPushButton("Connect")
         self.disconnect_button = QPushButton("Disconnect")
-        self.save_button = QPushButton("Save Settings")
+        self.save_button = QPushButton("Save")
 
         self.disconnect_button.setEnabled(False)
 
@@ -567,11 +676,10 @@ class MainWindow(QMainWindow):
 
         root_layout.addLayout(buttons_layout)
 
-        # Row 6: Log.
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setMaximumBlockCount(1000)
-        self.log_output.setMinimumHeight(95)
+        self.log_output.setMinimumHeight(90)
 
         root_layout.addWidget(QLabel("Log:"))
         root_layout.addWidget(self.log_output, stretch=1)
@@ -579,11 +687,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
 
     def _load_settings_into_ui(self) -> None:
-        client_id = config_get(self.config, "client_id", f"vf-{uuid.uuid4()}")
         display_name = config_get(self.config, "display_name", "CMDR Test")
 
         self.display_name_edit.setText(str(display_name))
-        self.client_id_edit.setText(str(client_id))
 
         self.system_name_edit.setText(
             str(config_get(self.config, "system_name", DEFAULT_SYSTEM_NAME))
@@ -592,25 +698,26 @@ class MainWindow(QMainWindow):
             str(config_get(self.config, "system_address", DEFAULT_SYSTEM_ADDRESS))
         )
 
+        game_mode = str(config_get(self.config, "game_mode", "Open"))
+        index = self.game_mode_combo.findText(game_mode)
+        self.game_mode_combo.setCurrentIndex(index if index >= 0 else 0)
+
+        self.group_name_edit.setText(str(config_get(self.config, "group", "")))
+
         self.ptt_key_edit.setText(str(config_get(self.config, "ptt_key", "f12")))
 
-        journal_dir = config_get(self.config, "journal_dir", str(default_journal_dir()))
-        self.journal_dir_edit.setText(str(journal_dir))
-        self.backend_url_edit.setText(
-            str(config_get(self.config, "backend_url", DEFAULT_BACKEND_URL))
-        )
         self.mute_checkbox.setChecked(bool(config_get(self.config, "muted", False)))
         self.deafen_checkbox.setChecked(bool(config_get(self.config, "deafened", False)))
 
-        self.start_minimized_checkbox.setChecked(
-            bool(config_get(self.config, "start_minimized", False))
-        )
-        self.auto_connect_checkbox.setChecked(
-            bool(config_get(self.config, "auto_connect", False))
-        )
-        self.minimize_to_tray_checkbox.setChecked(
-            bool(config_get(self.config, "minimize_to_tray", True))
-        )
+    def _try_apply_commander_name_from_journal(self) -> None:
+        commander_name = read_last_commander_name(self.journal_dir)
+
+        if not commander_name:
+            return
+
+        current_display = self.display_name_edit.text().strip()
+        if not current_display or current_display == "CMDR Test":
+            self.display_name_edit.setText(commander_name)
 
     def _populate_audio_devices(self) -> None:
         saved_input = self.config.get("input_device")
@@ -648,30 +755,39 @@ class MainWindow(QMainWindow):
                 combo.setCurrentIndex(i)
                 return
 
-    def _browse_journal_dir(self) -> None:
-        start_dir = self.journal_dir_edit.text().strip() or str(default_journal_dir())
-        chosen = QFileDialog.getExistingDirectory(
-            self,
-            "Select Elite Dangerous Journal Folder",
-            start_dir,
-        )
+    def _open_settings_dialog(self) -> None:
+        dialog = SettingsDialog(self)
 
-        if chosen:
-            self.journal_dir_edit.setText(chosen)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        values = dialog.values()
+
+        self.client_id = values["client_id"] or f"vf-{uuid.uuid4()}"
+        self.backend_url = values["backend_url"]
+        self.journal_dir = Path(values["journal_dir"])
+        self.start_minimized = bool(values["start_minimized"])
+        self.auto_connect = bool(values["auto_connect"])
+        self.minimize_to_tray = bool(values["minimize_to_tray"])
+
+        self.client_id_label.setText(self.client_id)
+        self.journal_dir_label.setText(str(self.journal_dir))
+
+        self._try_apply_commander_name_from_journal()
+        self._save_settings_from_ui()
 
     def _settings_from_ui(self) -> ClientSettings:
-        client_id = self.client_id_edit.text().strip() or f"vf-{uuid.uuid4()}"
+        client_id = self.client_id or f"vf-{uuid.uuid4()}"
         display_name = self.display_name_edit.text().strip() or "CMDR Test"
         ptt_key = self.ptt_key_edit.text().strip() or "f12"
 
         system_name = self.system_name_edit.text().strip() or DEFAULT_SYSTEM_NAME
         system_address = self.system_address_edit.text().strip() or DEFAULT_SYSTEM_ADDRESS
-
-        journal_dir_text = self.journal_dir_edit.text().strip()
-        journal_dir = Path(journal_dir_text) if journal_dir_text else default_journal_dir()
+        game_mode = self.game_mode_combo.currentText().strip() or "Open"
+        group = self.group_name_edit.text().strip()
 
         return ClientSettings(
-            backend_url=self.backend_url_edit.text().strip() or DEFAULT_BACKEND_URL,
+            backend_url=self.backend_url or DEFAULT_BACKEND_URL,
             client_id=client_id,
             display_name=display_name,
             ptt_key=ptt_key,
@@ -679,16 +795,25 @@ class MainWindow(QMainWindow):
             output_device=self.output_device_combo.currentData(),
             muted=self.mute_checkbox.isChecked(),
             deafened=self.deafen_checkbox.isChecked(),
-            start_minimized=self.start_minimized_checkbox.isChecked(),
-            auto_connect=self.auto_connect_checkbox.isChecked(),
-            minimize_to_tray=self.minimize_to_tray_checkbox.isChecked(),
-            journal_dir=journal_dir,
+            start_minimized=self.start_minimized,
+            auto_connect=self.auto_connect,
+            minimize_to_tray=self.minimize_to_tray,
+            journal_dir=self.journal_dir,
             system_name=system_name,
             system_address=system_address,
+            game_mode=game_mode,
+            group=group,
         )
 
     def _save_settings_from_ui(self) -> None:
         settings = self._settings_from_ui()
+
+        self.client_id = settings.client_id
+        self.backend_url = settings.backend_url
+        self.journal_dir = settings.journal_dir or default_journal_dir()
+        self.start_minimized = settings.start_minimized
+        self.auto_connect = settings.auto_connect
+        self.minimize_to_tray = settings.minimize_to_tray
 
         save_config(
             {
@@ -703,34 +828,33 @@ class MainWindow(QMainWindow):
                 "start_minimized": settings.start_minimized,
                 "auto_connect": settings.auto_connect,
                 "minimize_to_tray": settings.minimize_to_tray,
-                "journal_dir": str(settings.journal_dir),
+                "journal_dir": str(self.journal_dir),
                 "system_address": settings.system_address,
                 "system_name": settings.system_name,
+                "game_mode": settings.game_mode,
+                "group": settings.group,
             },
             self.config_path,
         )
 
-        self.client_id_edit.setText(settings.client_id)
+        self.client_id_label.setText(settings.client_id)
+        self.journal_dir_label.setText(str(self.journal_dir))
         self.log(f"Settings saved: {self.config_path}")
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.display_name_edit.setEnabled(enabled)
-        self.client_id_edit.setEnabled(enabled)
-        self.backend_url_edit.setEnabled(enabled)
         self.static_radio.setEnabled(enabled)
         self.journal_radio.setEnabled(enabled)
         self.system_name_edit.setEnabled(enabled)
         self.system_address_edit.setEnabled(enabled)
-        self.journal_dir_edit.setEnabled(enabled)
-        self.browse_journal_button.setEnabled(enabled)
+        self.game_mode_combo.setEnabled(enabled)
+        self.group_name_edit.setEnabled(enabled)
         self.input_device_combo.setEnabled(enabled)
         self.output_device_combo.setEnabled(enabled)
         self.refresh_devices_button.setEnabled(enabled)
         self.ptt_key_edit.setEnabled(enabled)
         self.save_button.setEnabled(enabled)
-        self.start_minimized_checkbox.setEnabled(enabled)
-        self.auto_connect_checkbox.setEnabled(enabled)
-        self.minimize_to_tray_checkbox.setEnabled(enabled)
+        self.settings_action.setEnabled(enabled)
 
     def _connect(self) -> None:
         if self.worker_thread is not None:
@@ -751,7 +875,9 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self._on_error)
         self.worker.connected.connect(self._on_connected)
         self.worker.disconnected.connect(self._on_disconnected)
+        self.worker.skipped_connection.connect(self._on_skipped_connection)
         self.worker.system_changed.connect(self._on_system_changed)
+        self.worker.commander_detected.connect(self._on_commander_detected)
         self.worker.participant_joined.connect(self._on_participant_joined)
         self.worker.participant_left.connect(self._on_participant_left)
         self.worker.participants_snapshot.connect(self._on_participants_snapshot)
@@ -787,6 +913,10 @@ class MainWindow(QMainWindow):
     def _on_connected(self, system_name: str, system_address: str) -> None:
         self.status_label.setText("Connected")
         self.current_system_label.setText(f"{system_name} ({system_address})")
+
+        if self.worker and self.worker.voice and self.worker.voice.current_state:
+            self.current_room_label.setText(self.worker.voice.current_state.room_name)
+
         self.log(f"Connected: {system_name} ({system_address})")
         self.tray_icon.setToolTip(f"Voidfarers Voice Client\nConnected: {system_name}")
 
@@ -802,20 +932,33 @@ class MainWindow(QMainWindow):
         self.mic_meter.setValue(0)
         self.output_buffer_label.setText("0 ms")
         self.participants_list.clear()
+        self.current_room_label.setText("None")
         self.tray_icon.setToolTip("Voidfarers Voice Client\nDisconnected")
 
         if self._really_quit:
             QTimer.singleShot(0, self._force_quit)
 
+    @Slot(str)
+    def _on_skipped_connection(self, reason: str) -> None:
+        self.status_label.setText(reason)
+        self.current_room_label.setText("Not connected")
+        self.participants_list.clear()
+        self.log(reason)
+
     @Slot(str, str)
     def _on_system_changed(self, system_name: str, system_address: str) -> None:
         self.current_system_label.setText(f"{system_name} ({system_address})")
+
+    @Slot(str)
+    def _on_commander_detected(self, commander_name: str) -> None:
+        current_display = self.display_name_edit.text().strip()
+        if not current_display or current_display == "CMDR Test":
+            self.display_name_edit.setText(commander_name)
 
     @Slot(str, str)
     def _on_participant_joined(self, identity: str, name: str) -> None:
         self.log(f"Participant joined: {identity} / {name}")
 
-        # Remove placeholder if present.
         for i in range(self.participants_list.count()):
             if self.participants_list.item(i).text() == "No other participants":
                 self.participants_list.takeItem(i)
@@ -888,12 +1031,7 @@ class MainWindow(QMainWindow):
         self.log_output.appendPlainText(message)
 
     def closeEvent(self, event) -> None:
-        minimize_to_tray = True
-
-        if hasattr(self, "minimize_to_tray_checkbox"):
-            minimize_to_tray = self.minimize_to_tray_checkbox.isChecked()
-
-        if minimize_to_tray and not self._really_quit:
+        if self.minimize_to_tray and not self._really_quit:
             event.ignore()
             self.hide()
 

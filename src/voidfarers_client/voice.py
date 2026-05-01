@@ -4,7 +4,7 @@ import asyncio
 import queue
 from typing import Callable
 
-from livekit import rtc
+from livekit import rtc # type: ignore
 
 from .app_state import NUM_CHANNELS, SAMPLE_RATE, SystemState
 from .audio import AudioEngine, audioframe_to_bytes
@@ -59,7 +59,16 @@ class VoiceClient:
             self.log(message)
 
     async def connect_to_system(self, state: SystemState) -> None:
-        self.log(f"Requesting token for {state.system_name} / {state.system_address}...")
+        if not state.voice_allowed:
+            raise RuntimeError(
+                f"Voice connection not allowed for this state: "
+                f"in_game={state.in_game}, game_mode={state.game_mode!r}"
+            )
+
+        self.log(
+            f"Requesting token for {state.system_name} / {state.system_address} "
+            f"/ {state.room_suffix}..."
+        )
 
         token_data = request_livekit_token(
             backend_url=self.backend_url,
@@ -67,6 +76,9 @@ class VoiceClient:
             display_name=self.display_name,
             system_address=state.system_address,
             system_name=state.system_name,
+            game_mode=state.game_mode,
+            group=state.group,
+            room_name=state.room_name,
         )
 
         if self.room:
@@ -81,7 +93,10 @@ class VoiceClient:
         await self.room.connect(token_data["url"], token_data["token"])
 
         self.log(f"Connected to room: {token_data['room']}")
-        self.log(f"Current system: {state.system_name} ({state.system_address})")
+        self.log(
+            f"Current system: {state.system_name} "
+            f"({state.system_address}, {state.room_suffix})"
+        )
 
         if self.on_system_changed:
             self.on_system_changed(state)
