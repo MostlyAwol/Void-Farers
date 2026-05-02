@@ -4,7 +4,7 @@ import asyncio
 import queue
 from typing import Callable
 
-from livekit import rtc # type: ignore
+from livekit import rtc
 
 from .app_state import NUM_CHANNELS, SAMPLE_RATE, SystemState
 from .audio import AudioEngine, audioframe_to_bytes
@@ -25,6 +25,7 @@ class VoiceClient:
         client_id: str,
         display_name: str,
         audio: AudioEngine,
+        session_token: str = "",
         on_log: LogCallback | None = None,
         on_system_changed: SystemCallback | None = None,
         on_participant_joined: ParticipantCallback | None = None,
@@ -34,12 +35,16 @@ class VoiceClient:
         self.backend_url = backend_url
         self.client_id = client_id
         self.display_name = display_name
+        self.session_token = session_token
         self.audio = audio
 
         self.room: rtc.Room | None = None
         self.source: rtc.AudioSource | None = None
         self.current_state: SystemState | None = None
         self.running = True
+
+        self.verified = False
+        self.server_display_name = display_name
 
         self.remote_tasks: set[asyncio.Task] = set()
 
@@ -79,7 +84,15 @@ class VoiceClient:
             game_mode=state.game_mode,
             group=state.group,
             room_name=state.room_name,
+            session_token=self.session_token,
+            platform="windows",
         )
+
+        self.verified = bool(token_data.get("verified", False))
+        self.server_display_name = str(token_data.get("display_name", self.display_name))
+
+        if self.verified:
+            self.log(f"Verified identity: {self.server_display_name}")
 
         if self.room:
             await self.disconnect_room()

@@ -8,10 +8,10 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import sounddevice as sd # type: ignore
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot # type: ignore
-from PySide6.QtGui import QAction, QIcon # type: ignore
-from PySide6.QtWidgets import ( # type: ignore
+import sounddevice as sd
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QAction, QIcon
+from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
@@ -45,6 +45,7 @@ from .app_state import (
     SystemState,
 )
 from .audio import AudioEngine
+from .backend import BackendError, get_me, pair_client
 from .config import default_config_path, load_config, save_config
 from .journal import default_journal_dir, read_last_commander_name, watch_system_changes
 from .ptt import PushToTalk
@@ -90,7 +91,7 @@ class SettingsDialog(QDialog):
 
         self.parent_window = parent
         self.setWindowTitle("Voidfarers Settings")
-        self.resize(520, 260)
+        self.resize(560, 360)
 
         layout = QVBoxLayout(self)
 
@@ -128,6 +129,36 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(form)
 
+        account_box = QGroupBox("Account Linking")
+        account_layout = QFormLayout(account_box)
+
+        self.verified_label = QLabel(parent.account_status_text())
+        self.pairing_code_edit = QLineEdit()
+        self.pairing_code_edit.setPlaceholderText("VF-XXXX-XXXX")
+        self.link_button = QPushButton("Link Account")
+        self.link_button.clicked.connect(self._link_account)
+
+        pair_row = QHBoxLayout()
+        pair_row.addWidget(self.pairing_code_edit, 1)
+        pair_row.addWidget(self.link_button)
+
+        self.refresh_account_button = QPushButton("Refresh Status")
+        self.refresh_account_button.clicked.connect(self._refresh_account_status)
+
+        self.clear_session_button = QPushButton("Clear Linked Account")
+        self.clear_session_button.clicked.connect(self._clear_session)
+
+        account_buttons = QHBoxLayout()
+        account_buttons.addWidget(self.refresh_account_button)
+        account_buttons.addWidget(self.clear_session_button)
+        account_buttons.addStretch()
+
+        account_layout.addRow("Status:", self.verified_label)
+        account_layout.addRow("Pairing code:", pair_row)
+        account_layout.addRow("", account_buttons)
+
+        layout.addWidget(account_box)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
@@ -148,6 +179,63 @@ class SettingsDialog(QDialog):
         if chosen:
             self.journal_dir_edit.setText(chosen)
 
+    def _link_account(self) -> None:
+        parent = self.parent_window
+        client_id = self.client_id_edit.text().strip() or parent.client_id or f"vf-{uuid.uuid4()}"
+        backend_url = self.backend_url_edit.text().strip() or DEFAULT_BACKEND_URL
+        pairing_code = self.pairing_code_edit.text().strip()
+
+        if not pairing_code:
+            QMessageBox.warning(self, "Pairing Code Required", "Enter a pairing code first.")
+            return
+
+        try:
+            data = pair_client(
+                backend_url=backend_url,
+                client_id=client_id,
+                pairing_code=pairing_code,
+                platform="windows",
+            )
+        except BackendError as exc:
+            QMessageBox.warning(self, "Pairing Failed", str(exc))
+            return
+
+        parent.client_id = client_id
+        parent.backend_url = backend_url
+        parent.session_token = data["session_token"]
+        parent.verified = True
+        parent.verified_commander_name = data["commander_name"]
+        parent.verified_frontier_id = data["frontier_commander_id"]
+
+        self.client_id_edit.setText(client_id)
+        self.pairing_code_edit.clear()
+        self.verified_label.setText(parent.account_status_text())
+
+        if parent.verified_commander_name:
+            parent.display_name_edit.setText(parent.verified_commander_name)
+
+        parent._save_settings_from_ui()
+        QMessageBox.information(
+            self,
+            "Account Linked",
+            f"Linked as {parent.verified_commander_name}",
+        )
+
+    def _refresh_account_status(self) -> None:
+        parent = self.parent_window
+        parent._refresh_account_status(show_message=True)
+        self.verified_label.setText(parent.account_status_text())
+
+    def _clear_session(self) -> None:
+        parent = self.parent_window
+        parent.session_token = ""
+        parent.verified = False
+        parent.verified_commander_name = ""
+        parent.verified_frontier_id = ""
+        self.verified_label.setText(parent.account_status_text())
+        parent._save_settings_from_ui()
+        QMessageBox.information(self, "Account Cleared", "Linked account cleared on this client.")
+
     def values(self) -> dict[str, Any]:
         return {
             "client_id": self.client_id_edit.text().strip(),
@@ -167,6 +255,7 @@ class VoiceWorker(QObject):
     skipped_connection = Signal(str)
     system_changed = Signal(str, str)
     commander_detected = Signal(str)
+    verified_identity = Signal(str, str)
     participant_joined = Signal(str, str)
     participant_left = Signal(str, str)
     participants_snapshot = Signal(list)
@@ -237,6 +326,7 @@ class VoiceWorker(QObject):
             backend_url=self.settings.backend_url,
             client_id=self.settings.client_id,
             display_name=self.settings.display_name,
+            session_token=self.settings.session_token,
             audio=self.audio,
             on_log=self.log.emit,
             on_error=self.error.emit,
@@ -330,6 +420,13 @@ class VoiceWorker(QObject):
             return
 
         await self.voice.connect_to_system(state)
+
+        if self.voice.verified:
+            self.verified_identity.emit(
+                self.voice.server_display_name,
+                self.settings.verified_frontier_id,
+            )
+
         self.connected.emit(state.system_name, state.system_address)
         self.emit_participants_snapshot()
 
@@ -388,7 +485,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Voidfarers Voice Client")
-        self.resize(720, 620)
+        self.resize(760, 540)
         self.setMinimumSize(720, 460)
 
         self.config_path = default_config_path()
@@ -410,12 +507,20 @@ class MainWindow(QMainWindow):
         self.auto_connect = bool(config_get(self.config, "auto_connect", False))
         self.minimize_to_tray = bool(config_get(self.config, "minimize_to_tray", True))
 
+        self.session_token = str(config_get(self.config, "session_token", ""))
+        self.verified = bool(config_get(self.config, "verified", False))
+        self.verified_commander_name = str(config_get(self.config, "verified_commander_name", ""))
+        self.verified_frontier_id = str(config_get(self.config, "verified_frontier_id", ""))
+
         self._build_menu()
         self._build_ui()
         self._load_settings_into_ui()
         self._populate_audio_devices()
         self._setup_tray()
         self._try_apply_commander_name_from_journal()
+
+        if self.session_token:
+            self._refresh_account_status(show_message=False)
 
         if self.start_minimized:
             QTimer.singleShot(0, self.hide)
@@ -425,6 +530,56 @@ class MainWindow(QMainWindow):
 
         self.stats_timer = QTimer(self)
         self.stats_timer.setInterval(1000)
+
+    def account_status_text(self) -> str:
+        if self.verified:
+            name = self.verified_commander_name or "Unknown Commander"
+            fid = self.verified_frontier_id or "Unknown ID"
+            return f"Verified as {name} ({fid})"
+        return "Unverified"
+
+    def _refresh_account_status(self, show_message: bool = False) -> None:
+        if not self.session_token:
+            self.verified = False
+            self.verified_commander_name = ""
+            self.verified_frontier_id = ""
+            if show_message:
+                QMessageBox.information(self, "Account Status", "No linked account.")
+            return
+
+        try:
+            data = get_me(
+                backend_url=self.backend_url,
+                client_id=self.client_id,
+                session_token=self.session_token,
+            )
+        except BackendError as exc:
+            if show_message:
+                QMessageBox.warning(self, "Account Check Failed", str(exc))
+            return
+
+        self.verified = bool(data.get("verified", False))
+
+        if self.verified:
+            self.verified_commander_name = str(data.get("commander_name") or "")
+            self.verified_frontier_id = str(data.get("frontier_commander_id") or "")
+
+            if self.verified_commander_name:
+                self.display_name_edit.setText(self.verified_commander_name)
+
+            if show_message:
+                QMessageBox.information(
+                    self,
+                    "Account Status",
+                    self.account_status_text(),
+                )
+        else:
+            self.verified_commander_name = ""
+            self.verified_frontier_id = ""
+            if show_message:
+                QMessageBox.information(self, "Account Status", "Session is not verified.")
+
+        self._save_settings_from_ui()
 
     def _build_menu(self) -> None:
         menu_bar = QMenuBar(self)
@@ -534,7 +689,6 @@ class MainWindow(QMainWindow):
 
         self.display_name_edit = QLineEdit()
         self.client_id_label = QLabel(self.client_id)
-        self.client_id_label.setTextInteractionFlags(self.client_id_label.textInteractionFlags())
 
         identity_layout.addRow("Display Name:", self.display_name_edit)
         identity_layout.addRow("Client ID:", self.client_id_label)
@@ -689,6 +843,9 @@ class MainWindow(QMainWindow):
     def _load_settings_into_ui(self) -> None:
         display_name = config_get(self.config, "display_name", "CMDR Test")
 
+        if self.verified_commander_name:
+            display_name = self.verified_commander_name
+
         self.display_name_edit.setText(str(display_name))
 
         self.system_name_edit.setText(
@@ -710,6 +867,10 @@ class MainWindow(QMainWindow):
         self.deafen_checkbox.setChecked(bool(config_get(self.config, "deafened", False)))
 
     def _try_apply_commander_name_from_journal(self) -> None:
+        if self.verified_commander_name:
+            self.display_name_edit.setText(self.verified_commander_name)
+            return
+
         commander_name = read_last_commander_name(self.journal_dir)
 
         if not commander_name:
@@ -790,6 +951,10 @@ class MainWindow(QMainWindow):
             backend_url=self.backend_url or DEFAULT_BACKEND_URL,
             client_id=client_id,
             display_name=display_name,
+            session_token=self.session_token,
+            verified=self.verified,
+            verified_commander_name=self.verified_commander_name,
+            verified_frontier_id=self.verified_frontier_id,
             ptt_key=ptt_key,
             input_device=self.input_device_combo.currentData(),
             output_device=self.output_device_combo.currentData(),
@@ -820,6 +985,10 @@ class MainWindow(QMainWindow):
                 "client_id": settings.client_id,
                 "display_name": settings.display_name,
                 "backend_url": settings.backend_url,
+                "session_token": settings.session_token,
+                "verified": settings.verified,
+                "verified_commander_name": settings.verified_commander_name,
+                "verified_frontier_id": settings.verified_frontier_id,
                 "ptt_key": settings.ptt_key,
                 "input_device": settings.input_device,
                 "output_device": settings.output_device,
@@ -878,6 +1047,7 @@ class MainWindow(QMainWindow):
         self.worker.skipped_connection.connect(self._on_skipped_connection)
         self.worker.system_changed.connect(self._on_system_changed)
         self.worker.commander_detected.connect(self._on_commander_detected)
+        self.worker.verified_identity.connect(self._on_verified_identity)
         self.worker.participant_joined.connect(self._on_participant_joined)
         self.worker.participant_left.connect(self._on_participant_left)
         self.worker.participants_snapshot.connect(self._on_participants_snapshot)
@@ -951,9 +1121,23 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_commander_detected(self, commander_name: str) -> None:
+        if self.verified_commander_name:
+            return
+
         current_display = self.display_name_edit.text().strip()
         if not current_display or current_display == "CMDR Test":
             self.display_name_edit.setText(commander_name)
+
+    @Slot(str, str)
+    def _on_verified_identity(self, commander_name: str, frontier_id: str) -> None:
+        self.verified = True
+        self.verified_commander_name = commander_name
+        if frontier_id:
+            self.verified_frontier_id = frontier_id
+        if commander_name:
+            self.display_name_edit.setText(commander_name)
+        self.log(self.account_status_text())
+        self._save_settings_from_ui()
 
     @Slot(str, str)
     def _on_participant_joined(self, identity: str, name: str) -> None:

@@ -18,10 +18,6 @@ MAX_OUTPUT_BUFFER_SECONDS = 0.5
 
 
 def safe_room_part(value: str) -> str:
-    """
-    Make a journal/GameMode/Group value safe enough for a LiveKit room suffix.
-    Keeps it readable while avoiding spaces and odd punctuation.
-    """
     value = value.strip()
     value = re.sub(r"\s+", "_", value)
     value = re.sub(r"[^A-Za-z0-9_.-]", "", value)
@@ -69,6 +65,11 @@ class ClientSettings:
     backend_url: str = DEFAULT_BACKEND_URL
     client_id: str = ""
     display_name: str = "CMDR Test"
+
+    session_token: str = ""
+    verified: bool = False
+    verified_commander_name: str = ""
+    verified_frontier_id: str = ""
 
     ptt_key: str = "f12"
 
