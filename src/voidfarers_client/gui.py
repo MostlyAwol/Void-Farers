@@ -485,7 +485,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Voidfarers Voice Client")
-        self.resize(760, 540)
+        self.resize(720, 650)
         self.setMinimumSize(720, 460)
 
         self.config_path = default_config_path()
