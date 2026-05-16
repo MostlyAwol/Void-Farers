@@ -56,7 +56,6 @@ def config_get(config: dict[str, Any], key: str, fallback: Any) -> Any:
     value = config.get(key)
     return fallback if value is None else value
 
-
 def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     input_devices: list[tuple[int, str]] = []
     output_devices: list[tuple[int, str]] = []
@@ -78,12 +77,10 @@ def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
 
     return input_devices, output_devices
 
-
 def resource_path(relative_path: str) -> Path:
     if hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS) / relative_path
     return Path(__file__).resolve().parents[2] / relative_path
-
 
 class SettingsDialog(QDialog):
     def __init__(self, parent: "MainWindow") -> None:
@@ -245,7 +242,6 @@ class SettingsDialog(QDialog):
             "auto_connect": self.auto_connect_checkbox.isChecked(),
             "minimize_to_tray": self.minimize_to_tray_checkbox.isChecked(),
         }
-
 
 class VoiceWorker(QObject):
     log = Signal(str)
@@ -478,7 +474,6 @@ class VoiceWorker(QObject):
             participants.append((participant.identity, participant.name))
 
         self.participants_snapshot.emit(participants)
-
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
