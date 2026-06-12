@@ -15,6 +15,7 @@ LogCallback = Callable[[str], None]
 SystemCallback = Callable[[SystemState], None]
 ParticipantCallback = Callable[[str, str], None]
 ErrorCallback = Callable[[str], None]
+VerifiedCallback = Callable[[str], None]
 
 
 class VoiceClient:
@@ -30,6 +31,7 @@ class VoiceClient:
         on_system_changed: SystemCallback | None = None,
         on_participant_joined: ParticipantCallback | None = None,
         on_participant_left: ParticipantCallback | None = None,
+        on_verified_identity: VerifiedCallback | None = None,
         on_error: ErrorCallback | None = None,
     ) -> None:
         self.backend_url = backend_url
@@ -52,6 +54,7 @@ class VoiceClient:
         self.on_system_changed = on_system_changed
         self.on_participant_joined = on_participant_joined
         self.on_participant_left = on_participant_left
+        self.on_verified_identity = on_verified_identity
         self.on_error = on_error
 
     def log(self, message: str) -> None:
@@ -93,6 +96,8 @@ class VoiceClient:
 
         if self.verified:
             self.log(f"Verified identity: {self.server_display_name}")
+            if self.on_verified_identity:
+                self.on_verified_identity(self.server_display_name)
 
         if self.room:
             await self.disconnect_room()

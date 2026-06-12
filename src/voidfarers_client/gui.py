@@ -5,6 +5,7 @@ import contextlib
 import sys
 import threading
 import uuid
+import webbrowser
 from pathlib import Path
 from typing import Any
 
@@ -31,19 +32,12 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QProgressBar,
-    QRadioButton,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
 
-from .app_state import (
-    DEFAULT_BACKEND_URL,
-    DEFAULT_SYSTEM_ADDRESS,
-    DEFAULT_SYSTEM_NAME,
-    ClientSettings,
-    SystemState,
-)
+from .app_state import ClientSettings, DEFAULT_BACKEND_URL, SystemState
 from .audio import AudioEngine
 from .backend import BackendError, get_me, pair_client
 from .config import default_config_path, load_config, save_config
@@ -55,6 +49,7 @@ from .voice import VoiceClient
 def config_get(config: dict[str, Any], key: str, fallback: Any) -> Any:
     value = config.get(key)
     return fallback if value is None else value
+
 
 def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     input_devices: list[tuple[int, str]] = []
@@ -77,10 +72,113 @@ def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
 
     return input_devices, output_devices
 
+
 def resource_path(relative_path: str) -> Path:
     if hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS) / relative_path
     return Path(__file__).resolve().parents[2] / relative_path
+
+
+class AccountLinkDialog(QDialog):
+    def __init__(
+        self,
+        parent: "MainWindow",
+        *,
+        first_run: bool = False,
+    ) -> None:
+        super().__init__(parent)
+
+        self.parent_window = parent
+        self.first_run = first_run
+
+        self.setWindowTitle("Link Frontier Account")
+        self.resize(520, 250)
+
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Voidfarers requires a linked Frontier commander account before connecting "
+            "to voice rooms.\n\n"
+            "1. Open the link page.\n"
+            "2. Log in with Frontier.\n"
+            "3. Copy the pairing code.\n"
+            "4. Paste it below and click Link Account."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.open_link_button = QPushButton("Open Account Link Page")
+        self.open_link_button.clicked.connect(self._open_link_page)
+        layout.addWidget(self.open_link_button)
+
+        form = QFormLayout()
+        self.pairing_code_edit = QLineEdit()
+        self.pairing_code_edit.setPlaceholderText("VF-XXXX-XXXX")
+
+        form.addRow("Pairing code:", self.pairing_code_edit)
+        layout.addLayout(form)
+
+        self.status_label = QLabel(parent.account_status_text())
+        layout.addWidget(self.status_label)
+
+        buttons_row = QHBoxLayout()
+
+        self.link_button = QPushButton("Link Account")
+        self.link_button.clicked.connect(self._link_account)
+
+        self.close_button = QPushButton("Close")
+        self.close_button.clicked.connect(self.reject)
+
+        buttons_row.addWidget(self.link_button)
+        buttons_row.addStretch()
+        buttons_row.addWidget(self.close_button)
+
+        layout.addLayout(buttons_row)
+
+    def _open_link_page(self) -> None:
+        url = self.parent_window.backend_url.rstrip("/") + "/link"
+        webbrowser.open(url)
+
+    def _link_account(self) -> None:
+        parent = self.parent_window
+        pairing_code = self.pairing_code_edit.text().strip()
+
+        if not pairing_code:
+            QMessageBox.warning(self, "Pairing Code Required", "Enter a pairing code first.")
+            return
+
+        try:
+            data = pair_client(
+                backend_url=parent.backend_url,
+                client_id=parent.client_id,
+                pairing_code=pairing_code,
+                platform="windows",
+            )
+        except BackendError as exc:
+            QMessageBox.warning(self, "Pairing Failed", str(exc))
+            return
+
+        parent.session_token = data["session_token"]
+        parent.verified = True
+        parent.verified_commander_name = data["commander_name"]
+        parent.verified_frontier_id = data["frontier_commander_id"]
+
+        if parent.verified_commander_name:
+            parent.display_name_edit.setText(parent.verified_commander_name)
+
+        parent.account_status_label.setText(parent.account_status_text())
+        parent._save_settings_from_ui()
+
+        self.status_label.setText(parent.account_status_text())
+
+        QMessageBox.information(
+            self,
+            "Account Linked",
+            f"Linked as {parent.verified_commander_name}",
+        )
+
+        self.accept()
+
 
 class SettingsDialog(QDialog):
     def __init__(self, parent: "MainWindow") -> None:
@@ -88,7 +186,7 @@ class SettingsDialog(QDialog):
 
         self.parent_window = parent
         self.setWindowTitle("Voidfarers Settings")
-        self.resize(560, 360)
+        self.resize(540, 260)
 
         layout = QVBoxLayout(self)
 
@@ -126,33 +224,18 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(form)
 
-        account_box = QGroupBox("Account Linking")
-        account_layout = QFormLayout(account_box)
+        account_box = QGroupBox("Account")
+        account_layout = QVBoxLayout(account_box)
 
-        self.verified_label = QLabel(parent.account_status_text())
-        self.pairing_code_edit = QLineEdit()
-        self.pairing_code_edit.setPlaceholderText("VF-XXXX-XXXX")
-        self.link_button = QPushButton("Link Account")
-        self.link_button.clicked.connect(self._link_account)
+        account_layout.addWidget(QLabel(parent.account_status_text()))
 
-        pair_row = QHBoxLayout()
-        pair_row.addWidget(self.pairing_code_edit, 1)
-        pair_row.addWidget(self.link_button)
+        link_button = QPushButton("Link Account...")
+        link_button.clicked.connect(self._open_account_link)
+        account_layout.addWidget(link_button)
 
-        self.refresh_account_button = QPushButton("Refresh Status")
-        self.refresh_account_button.clicked.connect(self._refresh_account_status)
-
-        self.clear_session_button = QPushButton("Clear Linked Account")
-        self.clear_session_button.clicked.connect(self._clear_session)
-
-        account_buttons = QHBoxLayout()
-        account_buttons.addWidget(self.refresh_account_button)
-        account_buttons.addWidget(self.clear_session_button)
-        account_buttons.addStretch()
-
-        account_layout.addRow("Status:", self.verified_label)
-        account_layout.addRow("Pairing code:", pair_row)
-        account_layout.addRow("", account_buttons)
+        clear_button = QPushButton("Clear Linked Account")
+        clear_button.clicked.connect(self._clear_linked_account)
+        account_layout.addWidget(clear_button)
 
         layout.addWidget(account_box)
 
@@ -176,60 +259,17 @@ class SettingsDialog(QDialog):
         if chosen:
             self.journal_dir_edit.setText(chosen)
 
-    def _link_account(self) -> None:
-        parent = self.parent_window
-        client_id = self.client_id_edit.text().strip() or parent.client_id or f"vf-{uuid.uuid4()}"
-        backend_url = self.backend_url_edit.text().strip() or DEFAULT_BACKEND_URL
-        pairing_code = self.pairing_code_edit.text().strip()
+    def _open_account_link(self) -> None:
+        dialog = AccountLinkDialog(self.parent_window)
+        dialog.exec()
 
-        if not pairing_code:
-            QMessageBox.warning(self, "Pairing Code Required", "Enter a pairing code first.")
-            return
-
-        try:
-            data = pair_client(
-                backend_url=backend_url,
-                client_id=client_id,
-                pairing_code=pairing_code,
-                platform="windows",
-            )
-        except BackendError as exc:
-            QMessageBox.warning(self, "Pairing Failed", str(exc))
-            return
-
-        parent.client_id = client_id
-        parent.backend_url = backend_url
-        parent.session_token = data["session_token"]
-        parent.verified = True
-        parent.verified_commander_name = data["commander_name"]
-        parent.verified_frontier_id = data["frontier_commander_id"]
-
-        self.client_id_edit.setText(client_id)
-        self.pairing_code_edit.clear()
-        self.verified_label.setText(parent.account_status_text())
-
-        if parent.verified_commander_name:
-            parent.display_name_edit.setText(parent.verified_commander_name)
-
-        parent._save_settings_from_ui()
-        QMessageBox.information(
-            self,
-            "Account Linked",
-            f"Linked as {parent.verified_commander_name}",
-        )
-
-    def _refresh_account_status(self) -> None:
-        parent = self.parent_window
-        parent._refresh_account_status(show_message=True)
-        self.verified_label.setText(parent.account_status_text())
-
-    def _clear_session(self) -> None:
+    def _clear_linked_account(self) -> None:
         parent = self.parent_window
         parent.session_token = ""
         parent.verified = False
         parent.verified_commander_name = ""
         parent.verified_frontier_id = ""
-        self.verified_label.setText(parent.account_status_text())
+        parent.account_status_label.setText(parent.account_status_text())
         parent._save_settings_from_ui()
         QMessageBox.information(self, "Account Cleared", "Linked account cleared on this client.")
 
@@ -243,6 +283,7 @@ class SettingsDialog(QDialog):
             "minimize_to_tray": self.minimize_to_tray_checkbox.isChecked(),
         }
 
+
 class VoiceWorker(QObject):
     log = Signal(str)
     error = Signal(str)
@@ -251,16 +292,15 @@ class VoiceWorker(QObject):
     skipped_connection = Signal(str)
     system_changed = Signal(str, str)
     commander_detected = Signal(str)
-    verified_identity = Signal(str, str)
+    verified_identity = Signal(str)
     participant_joined = Signal(str, str)
     participant_left = Signal(str, str)
     participants_snapshot = Signal(list)
     stats = Signal(bool, float, int, int)
 
-    def __init__(self, settings: ClientSettings, use_journal: bool) -> None:
+    def __init__(self, settings: ClientSettings) -> None:
         super().__init__()
         self.settings = settings
-        self.use_journal = use_journal
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread_id: int | None = None
@@ -332,6 +372,7 @@ class VoiceWorker(QObject):
             ),
             on_participant_joined=self.participant_joined.emit,
             on_participant_left=self.participant_left.emit,
+            on_verified_identity=self.verified_identity.emit,
         )
 
         self.ptt.start()
@@ -341,22 +382,7 @@ class VoiceWorker(QObject):
         self._stats_task = asyncio.create_task(self._stats_loop())
 
         try:
-            if self.use_journal:
-                await self._run_journal_mode()
-            else:
-                state = SystemState(
-                    system_address=self.settings.system_address,
-                    system_name=self.settings.system_name,
-                    game_mode=self.settings.game_mode or "Open",
-                    group=self.settings.group or "",
-                    commander_name=self.settings.display_name,
-                    in_game=True,
-                )
-                await self._connect_or_skip(state)
-
-                while self.voice.running and not self._stop_requested:
-                    await asyncio.sleep(0.2)
-
+            await self._run_journal_mode()
         finally:
             await self._shutdown()
 
@@ -416,13 +442,6 @@ class VoiceWorker(QObject):
             return
 
         await self.voice.connect_to_system(state)
-
-        if self.voice.verified:
-            self.verified_identity.emit(
-                self.voice.server_display_name,
-                self.settings.verified_frontier_id,
-            )
-
         self.connected.emit(state.system_name, state.system_address)
         self.emit_participants_snapshot()
 
@@ -475,13 +494,14 @@ class VoiceWorker(QObject):
 
         self.participants_snapshot.emit(participants)
 
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
         self.setWindowTitle("Voidfarers Voice Client")
-        self.resize(720, 650)
-        self.setMinimumSize(720, 460)
+        self.resize(760, 520)
+        self.setMinimumSize(720, 450)
 
         self.config_path = default_config_path()
         self.config = load_config(self.config_path)
@@ -517,10 +537,13 @@ class MainWindow(QMainWindow):
         if self.session_token:
             self._refresh_account_status(show_message=False)
 
+        if not self.session_token:
+            QTimer.singleShot(300, self._show_first_run_link_dialog)
+
         if self.start_minimized:
             QTimer.singleShot(0, self.hide)
 
-        if self.auto_connect:
+        if self.auto_connect and self.session_token:
             QTimer.singleShot(500, self._connect)
 
         self.stats_timer = QTimer(self)
@@ -531,13 +554,21 @@ class MainWindow(QMainWindow):
             name = self.verified_commander_name or "Unknown Commander"
             fid = self.verified_frontier_id or "Unknown ID"
             return f"Verified as {name} ({fid})"
-        return "Unverified"
+        return "Account not linked"
+
+    def _show_first_run_link_dialog(self) -> None:
+        if self.session_token:
+            return
+
+        dialog = AccountLinkDialog(self, first_run=True)
+        dialog.exec()
 
     def _refresh_account_status(self, show_message: bool = False) -> None:
         if not self.session_token:
             self.verified = False
             self.verified_commander_name = ""
             self.verified_frontier_id = ""
+            self.account_status_label.setText(self.account_status_text())
             if show_message:
                 QMessageBox.information(self, "Account Status", "No linked account.")
             return
@@ -574,6 +605,7 @@ class MainWindow(QMainWindow):
             if show_message:
                 QMessageBox.information(self, "Account Status", "Session is not verified.")
 
+        self.account_status_label.setText(self.account_status_text())
         self._save_settings_from_ui()
 
     def _build_menu(self) -> None:
@@ -581,6 +613,10 @@ class MainWindow(QMainWindow):
         self.setMenuBar(menu_bar)
 
         app_menu = menu_bar.addMenu("Voidfarers")
+
+        self.link_account_action = QAction("Link Account...", self)
+        self.link_account_action.triggered.connect(self._open_account_link_dialog)
+        app_menu.addAction(self.link_account_action)
 
         self.settings_action = QAction("Settings...", self)
         self.settings_action.triggered.connect(self._open_settings_dialog)
@@ -675,6 +711,9 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("font-weight: bold;")
         root_layout.addWidget(self.status_label)
 
+        self.account_status_label = QLabel("Account not linked")
+        root_layout.addWidget(self.account_status_label)
+
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
 
@@ -685,7 +724,14 @@ class MainWindow(QMainWindow):
         self.display_name_edit = QLineEdit()
         self.client_id_label = QLabel(self.client_id)
 
-        identity_layout.addRow("Display Name:", self.display_name_edit)
+        self.link_account_button = QPushButton("Link Account...")
+        self.link_account_button.clicked.connect(self._open_account_link_dialog)
+
+        display_row = QHBoxLayout()
+        display_row.addWidget(self.display_name_edit, 1)
+        display_row.addWidget(self.link_account_button)
+
+        identity_layout.addRow("Display Name:", display_row)
         identity_layout.addRow("Client ID:", self.client_id_label)
 
         participants_box = QGroupBox("Participants")
@@ -700,49 +746,6 @@ class MainWindow(QMainWindow):
         top_row.addWidget(participants_box, 1)
 
         root_layout.addLayout(top_row)
-
-        mode_box = QGroupBox("Mode")
-        mode_layout = QVBoxLayout(mode_box)
-        mode_layout.setSpacing(6)
-
-        mode_radio_layout = QHBoxLayout()
-        self.static_radio = QRadioButton("Static test room")
-        self.journal_radio = QRadioButton("Elite Dangerous journal mode")
-        self.static_radio.setChecked(True)
-
-        mode_radio_layout.addWidget(self.static_radio)
-        mode_radio_layout.addWidget(self.journal_radio)
-        mode_radio_layout.addStretch()
-
-        mode_layout.addLayout(mode_radio_layout)
-
-        static_layout = QHBoxLayout()
-        self.system_name_edit = QLineEdit()
-        self.system_address_edit = QLineEdit()
-        self.game_mode_combo = QComboBox()
-        self.game_mode_combo.addItems(["Open", "Group", "Solo"])
-        self.group_name_edit = QLineEdit()
-        self.group_name_edit.setPlaceholderText("Group name")
-
-        static_layout.addWidget(QLabel("System:"))
-        static_layout.addWidget(self.system_name_edit, 1)
-        static_layout.addWidget(QLabel("ID:"))
-        static_layout.addWidget(self.system_address_edit, 1)
-        static_layout.addWidget(QLabel("Mode:"))
-        static_layout.addWidget(self.game_mode_combo)
-        static_layout.addWidget(self.group_name_edit, 1)
-
-        mode_layout.addLayout(static_layout)
-
-        journal_info_row = QHBoxLayout()
-        self.journal_dir_label = QLabel(str(self.journal_dir))
-        self.journal_dir_label.setWordWrap(True)
-        journal_info_row.addWidget(QLabel("Journal:"))
-        journal_info_row.addWidget(self.journal_dir_label, 1)
-
-        mode_layout.addLayout(journal_info_row)
-
-        root_layout.addWidget(mode_box)
 
         audio_box = QGroupBox("Audio")
         audio_layout = QFormLayout(audio_box)
@@ -782,6 +785,7 @@ class MainWindow(QMainWindow):
 
         self.current_system_label = QLabel("None")
         self.current_room_label = QLabel("None")
+        self.current_game_mode_label = QLabel("Unknown")
         self.ptt_status_label = QLabel("--")
         self.output_buffer_label = QLabel("0 ms")
         self.dropped_label = QLabel("0")
@@ -794,6 +798,8 @@ class MainWindow(QMainWindow):
 
         status_layout.addWidget(QLabel("System:"))
         status_layout.addWidget(self.current_system_label, 2)
+        status_layout.addWidget(QLabel("Mode:"))
+        status_layout.addWidget(self.current_game_mode_label)
         status_layout.addWidget(QLabel("Room:"))
         status_layout.addWidget(self.current_room_label, 2)
         status_layout.addWidget(QLabel("PTT:"))
@@ -808,8 +814,8 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(status_box)
 
         buttons_layout = QHBoxLayout()
-        self.connect_button = QPushButton("Connect")
-        self.disconnect_button = QPushButton("Disconnect")
+        self.connect_button = QPushButton("Start")
+        self.disconnect_button = QPushButton("Stop")
         self.save_button = QPushButton("Save")
 
         self.disconnect_button.setEnabled(False)
@@ -843,23 +849,12 @@ class MainWindow(QMainWindow):
 
         self.display_name_edit.setText(str(display_name))
 
-        self.system_name_edit.setText(
-            str(config_get(self.config, "system_name", DEFAULT_SYSTEM_NAME))
-        )
-        self.system_address_edit.setText(
-            str(config_get(self.config, "system_address", DEFAULT_SYSTEM_ADDRESS))
-        )
-
-        game_mode = str(config_get(self.config, "game_mode", "Open"))
-        index = self.game_mode_combo.findText(game_mode)
-        self.game_mode_combo.setCurrentIndex(index if index >= 0 else 0)
-
-        self.group_name_edit.setText(str(config_get(self.config, "group", "")))
-
         self.ptt_key_edit.setText(str(config_get(self.config, "ptt_key", "f12")))
 
         self.mute_checkbox.setChecked(bool(config_get(self.config, "muted", False)))
         self.deafen_checkbox.setChecked(bool(config_get(self.config, "deafened", False)))
+
+        self.account_status_label.setText(self.account_status_text())
 
     def _try_apply_commander_name_from_journal(self) -> None:
         if self.verified_commander_name:
@@ -927,20 +922,18 @@ class MainWindow(QMainWindow):
         self.minimize_to_tray = bool(values["minimize_to_tray"])
 
         self.client_id_label.setText(self.client_id)
-        self.journal_dir_label.setText(str(self.journal_dir))
 
         self._try_apply_commander_name_from_journal()
         self._save_settings_from_ui()
+
+    def _open_account_link_dialog(self) -> None:
+        dialog = AccountLinkDialog(self)
+        dialog.exec()
 
     def _settings_from_ui(self) -> ClientSettings:
         client_id = self.client_id or f"vf-{uuid.uuid4()}"
         display_name = self.display_name_edit.text().strip() or "CMDR Test"
         ptt_key = self.ptt_key_edit.text().strip() or "f12"
-
-        system_name = self.system_name_edit.text().strip() or DEFAULT_SYSTEM_NAME
-        system_address = self.system_address_edit.text().strip() or DEFAULT_SYSTEM_ADDRESS
-        game_mode = self.game_mode_combo.currentText().strip() or "Open"
-        group = self.group_name_edit.text().strip()
 
         return ClientSettings(
             backend_url=self.backend_url or DEFAULT_BACKEND_URL,
@@ -959,10 +952,6 @@ class MainWindow(QMainWindow):
             auto_connect=self.auto_connect,
             minimize_to_tray=self.minimize_to_tray,
             journal_dir=self.journal_dir,
-            system_name=system_name,
-            system_address=system_address,
-            game_mode=game_mode,
-            group=group,
         )
 
     def _save_settings_from_ui(self) -> None:
@@ -993,44 +982,42 @@ class MainWindow(QMainWindow):
                 "auto_connect": settings.auto_connect,
                 "minimize_to_tray": settings.minimize_to_tray,
                 "journal_dir": str(self.journal_dir),
-                "system_address": settings.system_address,
-                "system_name": settings.system_name,
-                "game_mode": settings.game_mode,
-                "group": settings.group,
             },
             self.config_path,
         )
 
         self.client_id_label.setText(settings.client_id)
-        self.journal_dir_label.setText(str(self.journal_dir))
+        self.account_status_label.setText(self.account_status_text())
         self.log(f"Settings saved: {self.config_path}")
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.display_name_edit.setEnabled(enabled)
-        self.static_radio.setEnabled(enabled)
-        self.journal_radio.setEnabled(enabled)
-        self.system_name_edit.setEnabled(enabled)
-        self.system_address_edit.setEnabled(enabled)
-        self.game_mode_combo.setEnabled(enabled)
-        self.group_name_edit.setEnabled(enabled)
         self.input_device_combo.setEnabled(enabled)
         self.output_device_combo.setEnabled(enabled)
         self.refresh_devices_button.setEnabled(enabled)
         self.ptt_key_edit.setEnabled(enabled)
         self.save_button.setEnabled(enabled)
         self.settings_action.setEnabled(enabled)
+        self.link_account_action.setEnabled(enabled)
+        self.link_account_button.setEnabled(enabled)
 
     def _connect(self) -> None:
         if self.worker_thread is not None:
             return
 
+        if not self.session_token:
+            self._open_account_link_dialog()
+
+        if not self.session_token:
+            self.status_label.setText("Account not linked")
+            self.log("Account not linked. Link your Frontier account before starting voice.")
+            return
+
         settings = self._settings_from_ui()
         self._save_settings_from_ui()
 
-        use_journal = self.journal_radio.isChecked()
-
         self.worker_thread = QThread()
-        self.worker = VoiceWorker(settings=settings, use_journal=use_journal)
+        self.worker = VoiceWorker(settings=settings)
         self.worker.moveToThread(self.worker_thread)
 
         self.worker_thread.started.connect(self.worker.start)
@@ -1053,7 +1040,7 @@ class MainWindow(QMainWindow):
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.worker_thread.finished.connect(self._clear_worker_refs)
 
-        self.status_label.setText("Connecting...")
+        self.status_label.setText("Watching journal...")
         self.connect_button.setEnabled(False)
         self.disconnect_button.setEnabled(True)
         self.connect_action.setEnabled(False)
@@ -1064,7 +1051,7 @@ class MainWindow(QMainWindow):
 
     def _disconnect(self) -> None:
         if self.worker:
-            self.status_label.setText("Disconnecting...")
+            self.status_label.setText("Stopping...")
             self.worker.request_stop()
 
         self.disconnect_button.setEnabled(False)
@@ -1080,7 +1067,9 @@ class MainWindow(QMainWindow):
         self.current_system_label.setText(f"{system_name} ({system_address})")
 
         if self.worker and self.worker.voice and self.worker.voice.current_state:
-            self.current_room_label.setText(self.worker.voice.current_state.room_name)
+            state = self.worker.voice.current_state
+            self.current_room_label.setText(state.room_name)
+            self.current_game_mode_label.setText(state.game_mode or "Unknown")
 
         self.log(f"Connected: {system_name} ({system_address})")
         self.tray_icon.setToolTip(f"Voidfarers Voice Client\nConnected: {system_name}")
@@ -1098,6 +1087,7 @@ class MainWindow(QMainWindow):
         self.output_buffer_label.setText("0 ms")
         self.participants_list.clear()
         self.current_room_label.setText("None")
+        self.current_game_mode_label.setText("Unknown")
         self.tray_icon.setToolTip("Voidfarers Voice Client\nDisconnected")
 
         if self._really_quit:
@@ -1123,14 +1113,13 @@ class MainWindow(QMainWindow):
         if not current_display or current_display == "CMDR Test":
             self.display_name_edit.setText(commander_name)
 
-    @Slot(str, str)
-    def _on_verified_identity(self, commander_name: str, frontier_id: str) -> None:
+    @Slot(str)
+    def _on_verified_identity(self, commander_name: str) -> None:
         self.verified = True
         self.verified_commander_name = commander_name
-        if frontier_id:
-            self.verified_frontier_id = frontier_id
         if commander_name:
             self.display_name_edit.setText(commander_name)
+        self.account_status_label.setText(self.account_status_text())
         self.log(self.account_status_text())
         self._save_settings_from_ui()
 
