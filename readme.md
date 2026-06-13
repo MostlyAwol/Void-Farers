@@ -313,6 +313,16 @@ Do not place backend secrets, LiveKit API secrets, Frontier client secrets, or a
 
 ---
 
+## Service Dependency
+
+The Voidfarers Voice Client is open source, but it is designed to connect to the official Voidfarers backend service.
+
+The backend service, LiveKit infrastructure, Frontier OAuth configuration, verification system, and moderation tools are operated separately and are not included in this client repository.
+
+Forks or modified versions of this client may require their own compatible backend service to function.
+
+---
+
 ## License
 
 Copyright © 2026 Jay Clark
