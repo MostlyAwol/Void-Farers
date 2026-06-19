@@ -1,13 +1,24 @@
-# Voidfarers Voice Client (VERSION b1.01a)
+# Voidfarers Voice Client (VERSION b1.02)
 
 [Latest Release](https://github.com/MostlyAwol/Void-Farers/releases/latest)
 
----
+## BUG Fixes
+
+1.02
+* PTT bug fix on Joystick polling stopped working
+* Microphone Meter set to a Log scale
+* Should find the journal file that matches the Verified CMDR
+
+1.01a
+* PTT Bug Fix due to a random tab of a code block
+
+1.01
 * Changes Added Keyboard/Mouse/Joystick support for the Push-to-Talk button with the ability to set it by pushing the button.
 * Some backend frameworks for some Server Status for the client. 
 
 ---
 
+## About
 
 Voidfarers is an experimental proximity/system voice client for **Elite Dangerous**.
 
