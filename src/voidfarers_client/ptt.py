@@ -14,6 +14,27 @@ except Exception:
     pygame = None
 
 
+_PYGAME_JOYSTICK_LOCK = threading.Lock()
+
+def reset_pygame_joysticks() -> bool:
+    if pygame is None:
+        return False
+
+    with _PYGAME_JOYSTICK_LOCK:
+        with contextlib.suppress(Exception):
+            pygame.init()
+
+        with contextlib.suppress(Exception):
+            pygame.joystick.quit()
+
+        time.sleep(0.05)
+
+        with contextlib.suppress(Exception):
+            pygame.joystick.init()
+
+        return True
+
+
 @dataclass(frozen=True)
 class PttBinding:
     kind: str
@@ -194,9 +215,8 @@ class PushToTalk:
         if pygame is None:
             return
 
-        with contextlib.suppress(Exception):
-            pygame.init()
-            pygame.joystick.init()
+        if not reset_pygame_joysticks():
+            return
 
         joystick_index = self.binding.joystick_index or 0
 
@@ -290,9 +310,8 @@ def capture_ptt_binding(
         if pygame is None:
             return
 
-        with contextlib.suppress(Exception):
-            pygame.init()
-            pygame.joystick.init()
+        if not reset_pygame_joysticks():
+            return
 
         try:
             joysticks = []
@@ -346,6 +365,9 @@ def capture_ptt_binding(
         mouse_listener.stop()
 
     joystick_thread.join(timeout=1.0)
+
+    if pygame is not None:
+        reset_pygame_joysticks()    
 
     if cancel_event.is_set():
         return None

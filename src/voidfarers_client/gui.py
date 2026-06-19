@@ -8,7 +8,7 @@ import uuid
 import webbrowser
 from pathlib import Path
 from typing import Any
-
+import math
 
 import sounddevice as sd
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, QPoint
@@ -79,6 +79,32 @@ def resource_path(relative_path: str) -> Path:
         return Path(sys._MEIPASS) / relative_path
     return Path(__file__).resolve().parents[2] / relative_path
 
+def mic_level_to_meter_percent(level: float) -> int:
+    """
+    Convert raw RMS-style mic level into a user-friendly meter value.
+
+    Raw audio amplitude is not perceived linearly by users. This maps it
+    to a dB-style scale where normal speech shows useful movement.
+    """
+
+    if level <= 0:
+        return 0
+
+    # Prevent log10 problems and clamp very tiny noise.
+    level = max(level, 0.000001)
+
+    db = 20.0 * math.log10(level)
+
+    # Display range.
+    # -60 dB = silence/very quiet
+    #   0 dB = full scale/clipping
+    min_db = -60.0
+    max_db = 0.0
+
+    percent = (db - min_db) / (max_db - min_db)
+    percent = max(0.0, min(1.0, percent))
+
+    return int(percent * 100)
 
 class AccountLinkDialog(QDialog):
     def __init__(
@@ -512,6 +538,7 @@ class MainWindow(QMainWindow):
         self.worker_thread: QThread | None = None
         self.worker: VoiceWorker | None = None
         self._really_quit = False
+        self._mic_meter_smoothed = 0.0
 
         self.input_devices: list[tuple[int, str]] = []
         self.output_devices: list[tuple[int, str]] = []
@@ -807,6 +834,7 @@ class MainWindow(QMainWindow):
         self.mic_meter.setValue(0)
         self.mic_meter.setTextVisible(True)
         self.mic_meter.setMaximumWidth(150)
+        self.mic_meter.setFormat("%p%")
 
         status_layout.addWidget(QLabel("System:"))
         status_layout.addWidget(self.current_system_label, 2)
@@ -1141,6 +1169,7 @@ class MainWindow(QMainWindow):
         self.ptt_key_edit.setText(binding)
         self.ptt_key_edit.setToolTip(describe_ptt_binding(binding))
         self.log(f"PTT set to: {describe_ptt_binding(binding)}")
+        self._save_settings_from_ui()
 
     @Slot()
     def _clear_worker_refs(self) -> None:
@@ -1250,7 +1279,15 @@ class MainWindow(QMainWindow):
         dropped: int,
     ) -> None:
         self.ptt_status_label.setText("TX" if ptt_active else "--")
-        self.mic_meter.setValue(int(max(0.0, min(1.0, mic_level)) * 100))
+        target = mic_level_to_meter_percent(mic_level)
+
+        # Fast rise, slower fall, like a basic VU meter.
+        if target > self._mic_meter_smoothed:
+            self._mic_meter_smoothed = (self._mic_meter_smoothed * 0.35) + (target * 0.65)
+        else:
+            self._mic_meter_smoothed = (self._mic_meter_smoothed * 0.85) + (target * 0.15)
+
+        self.mic_meter.setValue(int(self._mic_meter_smoothed))
         self.output_buffer_label.setText(f"{output_ms} ms")
         self.dropped_label.setText(str(dropped))
 
