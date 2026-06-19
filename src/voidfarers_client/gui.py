@@ -9,8 +9,9 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 
+
 import sounddevice as sd
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, QPoint
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,7 +43,7 @@ from .audio import AudioEngine
 from .backend import BackendError, get_me, pair_client
 from .config import default_config_path, load_config, save_config
 from .journal import default_journal_dir, read_last_commander_name, watch_system_changes
-from .ptt import PushToTalk
+from .ptt import PushToTalk, capture_ptt_binding, describe_ptt_binding
 from .voice import VoiceClient
 
 
@@ -283,6 +284,8 @@ class SettingsDialog(QDialog):
             "minimize_to_tray": self.minimize_to_tray_checkbox.isChecked(),
         }
 
+class PttCaptureNotifier(QObject):
+    finished = Signal(object)
 
 class VoiceWorker(QObject):
     log = Signal(str)
@@ -499,9 +502,9 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
-        self.setWindowTitle("Voidfarers Voice Client")
-        self.resize(760, 520)
-        self.setMinimumSize(720, 450)
+        self.setWindowTitle("Voidfarers Voice Client - Version b1.01")
+        self.resize(760, 580)
+        self.setMinimumSize(760, 580)
 
         self.config_path = default_config_path()
         self.config = load_config(self.config_path)
@@ -757,7 +760,11 @@ class MainWindow(QMainWindow):
         self.refresh_devices_button.clicked.connect(self._populate_audio_devices)
 
         self.ptt_key_edit = QLineEdit()
-        self.ptt_key_edit.setPlaceholderText("Example: f12, f11, ctrl_r")
+        self.ptt_key_edit.setReadOnly(True)
+        self.ptt_key_edit.setPlaceholderText("keyboard:f12")
+
+        self.set_ptt_button = QPushButton("Set...")
+        self.set_ptt_button.clicked.connect(self._capture_ptt_binding)
 
         self.mute_checkbox = QCheckBox("Mute microphone")
         self.deafen_checkbox = QCheckBox("Deafen output")
@@ -765,12 +772,17 @@ class MainWindow(QMainWindow):
         audio_layout.addRow("Input:", self.input_device_combo)
         audio_layout.addRow("Output:", self.output_device_combo)
 
+        ptt_row = QHBoxLayout()
+        ptt_row.addWidget(self.ptt_key_edit, 1)
+        ptt_row.addWidget(self.set_ptt_button)
+
+        audio_layout.addRow("PTT:", ptt_row)
+
         audio_controls_row = QHBoxLayout()
-        audio_controls_row.addWidget(QLabel("PTT:"))
-        audio_controls_row.addWidget(self.ptt_key_edit)
         audio_controls_row.addWidget(self.refresh_devices_button)
         audio_controls_row.addWidget(self.mute_checkbox)
         audio_controls_row.addWidget(self.deafen_checkbox)
+        audio_controls_row.addStretch()
 
         audio_layout.addRow("", audio_controls_row)
 
@@ -849,7 +861,9 @@ class MainWindow(QMainWindow):
 
         self.display_name_edit.setText(str(display_name))
 
-        self.ptt_key_edit.setText(str(config_get(self.config, "ptt_key", "f12")))
+        ptt_binding = str(config_get(self.config, "ptt_key", "keyboard:f12"))
+        self.ptt_key_edit.setText(ptt_binding)
+        self.ptt_key_edit.setToolTip(describe_ptt_binding(ptt_binding))
 
         self.mute_checkbox.setChecked(bool(config_get(self.config, "muted", False)))
         self.deafen_checkbox.setChecked(bool(config_get(self.config, "deafened", False)))
@@ -933,7 +947,7 @@ class MainWindow(QMainWindow):
     def _settings_from_ui(self) -> ClientSettings:
         client_id = self.client_id or f"vf-{uuid.uuid4()}"
         display_name = self.display_name_edit.text().strip() or "CMDR Test"
-        ptt_key = self.ptt_key_edit.text().strip() or "f12"
+        ptt_key = self.ptt_key_edit.text().strip() or "keyboard:f12"
 
         return ClientSettings(
             backend_url=self.backend_url or DEFAULT_BACKEND_URL,
@@ -996,6 +1010,7 @@ class MainWindow(QMainWindow):
         self.output_device_combo.setEnabled(enabled)
         self.refresh_devices_button.setEnabled(enabled)
         self.ptt_key_edit.setEnabled(enabled)
+        self.set_ptt_button.setEnabled(enabled)
         self.save_button.setEnabled(enabled)
         self.settings_action.setEnabled(enabled)
         self.link_account_action.setEnabled(enabled)
@@ -1056,49 +1071,83 @@ class MainWindow(QMainWindow):
 
         self.disconnect_button.setEnabled(False)
 
-    @Slot()
-    def _clear_worker_refs(self) -> None:
-        self.worker_thread = None
-        self.worker = None
+    def _capture_ptt_binding(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Set Push-to-Talk")
+        dialog.resize(420, 140)
 
-    @Slot(str, str)
-    def _on_connected(self, system_name: str, system_address: str) -> None:
-        self.status_label.setText("Connected")
-        self.current_system_label.setText(f"{system_name} ({system_address})")
+        layout = QVBoxLayout(dialog)
 
-        if self.worker and self.worker.voice and self.worker.voice.current_state:
-            state = self.worker.voice.current_state
-            self.current_room_label.setText(state.room_name)
-            self.current_game_mode_label.setText(state.game_mode or "Unknown")
+        label = QLabel(
+            "Press a keyboard, mouse, or joystick button now.\n\n"
+            "For mouse buttons, click outside this dialog.\n"
+            "Clicks inside this dialog are ignored."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
 
-        self.log(f"Connected: {system_name} ({system_address})")
-        self.tray_icon.setToolTip(f"Voidfarers Voice Client\nConnected: {system_name}")
+        buttons_row = QHBoxLayout()
+        buttons_row.addStretch()
 
-    @Slot()
-    def _on_disconnected(self) -> None:
-        self.status_label.setText("Disconnected")
-        self.connect_button.setEnabled(True)
-        self.disconnect_button.setEnabled(False)
-        self.connect_action.setEnabled(True)
-        self.disconnect_action.setEnabled(False)
-        self._set_controls_enabled(True)
-        self.ptt_status_label.setText("--")
-        self.mic_meter.setValue(0)
-        self.output_buffer_label.setText("0 ms")
-        self.participants_list.clear()
-        self.current_room_label.setText("None")
-        self.current_game_mode_label.setText("Unknown")
-        self.tray_icon.setToolTip("Voidfarers Voice Client\nDisconnected")
+        cancel_button = QPushButton("Cancel")
+        buttons_row.addWidget(cancel_button)
 
-        if self._really_quit:
-            QTimer.singleShot(0, self._force_quit)
+        layout.addLayout(buttons_row)
 
-    @Slot(str)
-    def _on_skipped_connection(self, reason: str) -> None:
-        self.status_label.setText(reason)
-        self.current_room_label.setText("Not connected")
-        self.participants_list.clear()
-        self.log(reason)
+        cancel_event = threading.Event()
+        result: dict[str, str | None] = {"binding": None}
+
+        notifier = PttCaptureNotifier(dialog)
+
+        def on_finished(binding: object) -> None:
+            result["binding"] = binding if isinstance(binding, str) else None
+
+            if dialog.isVisible():
+                dialog.accept()
+
+        notifier.finished.connect(on_finished)
+
+        def ignore_mouse_click(x: int, y: int) -> bool:
+            return dialog.frameGeometry().contains(QPoint(x, y))
+
+        def capture_worker() -> None:
+            binding = capture_ptt_binding(
+                timeout_seconds=15.0,
+                cancel_event=cancel_event,
+                ignore_mouse_click=ignore_mouse_click,
+            )
+            notifier.finished.emit(binding)
+
+        def cancel_capture() -> None:
+            cancel_event.set()
+            dialog.reject()
+
+        cancel_button.clicked.connect(cancel_capture)
+
+        thread = threading.Thread(target=capture_worker, daemon=True)
+        thread.start()
+
+        dialog.exec()
+
+        cancel_event.set()
+        thread.join(timeout=1.0)
+
+        binding = result["binding"]
+
+        if not binding:
+            self.log("PTT binding capture cancelled or timed out.")
+            return
+
+        self.ptt_key_edit.setText(binding)
+        self.ptt_key_edit.setToolTip(describe_ptt_binding(binding))
+        self.log(f"PTT set to: {describe_ptt_binding(binding)}")
+
+        @Slot(str)
+        def _on_skipped_connection(self, reason: str) -> None:
+            self.status_label.setText(reason)
+            self.current_room_label.setText("Not connected")
+            self.participants_list.clear()
+            self.log(reason)
 
     @Slot(str, str)
     def _on_system_changed(self, system_name: str, system_address: str) -> None:

@@ -1,4 +1,13 @@
-# Voidfarers Voice Client
+# Voidfarers Voice Client (VERSION b1.01)
+
+[Latest Release](https://github.com/MostlyAwol/Void-Farers/releases/latest)
+
+---
+* Changes Added Keyboard/Mouse/Joystick support for the Push-to-Talk button with the ability to set it by pushing the button.
+* Some backend frameworks for some Server Status for the client. 
+
+---
+
 
 Voidfarers is an experimental proximity/system voice client for **Elite Dangerous**.
 

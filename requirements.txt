@@ -6,3 +6,4 @@ numpy
 pynput
 platformdirs
 PySide6
+pygame
