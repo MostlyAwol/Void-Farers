@@ -14,27 +14,6 @@ except Exception:
     pygame = None
 
 
-_PYGAME_JOYSTICK_LOCK = threading.Lock()
-
-def reset_pygame_joysticks() -> bool:
-    if pygame is None:
-        return False
-
-    with _PYGAME_JOYSTICK_LOCK:
-        with contextlib.suppress(Exception):
-            pygame.init()
-
-        with contextlib.suppress(Exception):
-            pygame.joystick.quit()
-
-        time.sleep(0.05)
-
-        with contextlib.suppress(Exception):
-            pygame.joystick.init()
-
-        return True
-
-
 @dataclass(frozen=True)
 class PttBinding:
     kind: str
@@ -109,7 +88,6 @@ def normalize_mouse_button(button) -> str | None:
     if button == mouse.Button.middle:
         return "middle"
 
-    # pynput names these x1/x2 on platforms that expose them.
     name = getattr(button, "name", None)
     if name:
         return name.lower()
@@ -132,6 +110,138 @@ def describe_ptt_binding(raw: str) -> str:
     return raw
 
 
+class JoystickPoller:
+    """
+    One persistent pygame joystick poller for the whole app session.
+
+    Do not repeatedly init/quit pygame joystick devices for capture/live PTT.
+    That causes stale joystick state on some Windows setups.
+    """
+
+    def __init__(self) -> None:
+        self.running = False
+        self.thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
+
+        self.lock = threading.Lock()
+        self.button_states: dict[tuple[int, int], bool] = {}
+        self.press_counter = 0
+        self.last_press: tuple[int, str] | None = None
+
+        self.joysticks = []
+        self.last_device_refresh = 0.0
+
+    def start(self) -> None:
+        if pygame is None:
+            return
+
+        if self.running:
+            return
+
+        self.running = True
+        self.stop_event.clear()
+
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def is_button_pressed(self, joystick_index: int, button_index: int) -> bool:
+        self.start()
+
+        with self.lock:
+            return bool(self.button_states.get((joystick_index, button_index), False))
+
+    def get_press_counter(self) -> int:
+        with self.lock:
+            return self.press_counter
+
+    def get_press_after(self, counter: int) -> str | None:
+        with self.lock:
+            if self.last_press and self.last_press[0] > counter:
+                return self.last_press[1]
+        return None
+
+    def _refresh_devices(self) -> None:
+        if pygame is None:
+            return
+
+        now = time.monotonic()
+
+        # Refresh occasionally so newly connected devices can appear.
+        if self.joysticks and now - self.last_device_refresh < 2.0:
+            return
+
+        self.last_device_refresh = now
+
+        with contextlib.suppress(Exception):
+            pygame.init()
+            pygame.joystick.init()
+
+        joysticks = []
+
+        with contextlib.suppress(Exception):
+            count = pygame.joystick.get_count()
+
+            for joystick_index in range(count):
+                joystick = pygame.joystick.Joystick(joystick_index)
+                joystick.init()
+                joysticks.append(joystick)
+
+        self.joysticks = joysticks
+
+    def _run(self) -> None:
+        if pygame is None:
+            return
+
+        with contextlib.suppress(Exception):
+            pygame.init()
+            pygame.joystick.init()
+
+        previous_states: dict[tuple[int, int], bool] = {}
+
+        while not self.stop_event.is_set():
+            self._refresh_devices()
+
+            with contextlib.suppress(Exception):
+                pygame.event.pump()
+
+            new_states: dict[tuple[int, int], bool] = {}
+
+            for joystick_index, joystick in enumerate(self.joysticks):
+                try:
+                    button_count = joystick.get_numbuttons()
+                except Exception:
+                    continue
+
+                for button_index in range(button_count):
+                    key = (joystick_index, button_index)
+
+                    try:
+                        pressed = bool(joystick.get_button(button_index))
+                    except Exception:
+                        pressed = False
+
+                    new_states[key] = pressed
+
+                    was_pressed = previous_states.get(key, False)
+
+                    if pressed and not was_pressed:
+                        binding = f"joystick:{joystick_index}:button:{button_index}"
+
+                        with self.lock:
+                            self.press_counter += 1
+                            self.last_press = (self.press_counter, binding)
+
+            previous_states = new_states
+
+            with self.lock:
+                self.button_states = new_states
+
+            time.sleep(0.02)
+
+
+_JOYSTICK_POLLER = JoystickPoller()
+
+
 class PushToTalk:
     def __init__(self, binding: str = "keyboard:f12") -> None:
         self.binding = PttBinding.parse(binding)
@@ -146,6 +256,7 @@ class PushToTalk:
 
     def start(self) -> None:
         self.running = True
+        self.active = False
 
         self.keyboard_listener = keyboard.Listener(
             on_press=self._on_key_press,
@@ -159,6 +270,7 @@ class PushToTalk:
         self.mouse_listener.start()
 
         if self.binding.kind == "joystick":
+            _JOYSTICK_POLLER.start()
             self._start_joystick_polling()
 
     def stop(self) -> None:
@@ -178,6 +290,8 @@ class PushToTalk:
         if self._joystick_thread:
             self._joystick_thread.join(timeout=1.0)
             self._joystick_thread = None
+
+        self._joystick_stop.clear()
 
     def _on_key_press(self, key) -> None:
         if self.binding.kind != "keyboard":
@@ -212,35 +326,21 @@ class PushToTalk:
         self._joystick_thread.start()
 
     def _joystick_poll_loop(self) -> None:
-        if pygame is None:
-            return
-
-        if not reset_pygame_joysticks():
-            return
-
         joystick_index = self.binding.joystick_index or 0
 
         try:
-            if pygame.joystick.get_count() <= joystick_index:
-                return
-
-            joystick = pygame.joystick.Joystick(joystick_index)
-            joystick.init()
-
             button_index = int(self.binding.value)
+        except ValueError:
+            return
 
-            while not self._joystick_stop.is_set():
-                pygame.event.pump()
+        while not self._joystick_stop.is_set():
+            self.active = _JOYSTICK_POLLER.is_button_pressed(
+                joystick_index,
+                button_index,
+            )
+            time.sleep(0.02)
 
-                try:
-                    self.active = bool(joystick.get_button(button_index))
-                except Exception:
-                    self.active = False
-
-                time.sleep(0.02)
-
-        except Exception:
-            self.active = False
+        self.active = False
 
 
 def capture_ptt_binding(
@@ -264,6 +364,9 @@ def capture_ptt_binding(
 
     if cancel_event is None:
         cancel_event = threading.Event()
+
+    _JOYSTICK_POLLER.start()
+    joystick_start_counter = _JOYSTICK_POLLER.get_press_counter()
 
     def finish(binding: str) -> None:
         if result["binding"] is None and not cancel_event.is_set():
@@ -304,70 +407,25 @@ def capture_ptt_binding(
     keyboard_listener.start()
     mouse_listener.start()
 
-    joystick_thread_stop = threading.Event()
-
-    def joystick_capture_loop() -> None:
-        if pygame is None:
-            return
-
-        if not reset_pygame_joysticks():
-            return
-
-        try:
-            joysticks = []
-
-            for joystick_index in range(pygame.joystick.get_count()):
-                joystick = pygame.joystick.Joystick(joystick_index)
-                joystick.init()
-                joysticks.append(joystick)
-
-            previous_states: dict[tuple[int, int], bool] = {}
-
-            while (
-                not joystick_thread_stop.is_set()
-                and not done.is_set()
-                and not cancel_event.is_set()
-            ):
-                pygame.event.pump()
-
-                for joystick_index, joystick in enumerate(joysticks):
-                    for button_index in range(joystick.get_numbuttons()):
-                        key = (joystick_index, button_index)
-                        pressed = bool(joystick.get_button(button_index))
-                        was_pressed = previous_states.get(key, False)
-                        previous_states[key] = pressed
-
-                        if pressed and not was_pressed:
-                            finish(f"joystick:{joystick_index}:button:{button_index}")
-                            return
-
-                time.sleep(0.02)
-
-        except Exception:
-            return
-
-    joystick_thread = threading.Thread(target=joystick_capture_loop, daemon=True)
-    joystick_thread.start()
-
     end_time = time.monotonic() + timeout_seconds
 
     while time.monotonic() < end_time:
         if done.is_set() or cancel_event.is_set():
             break
-        time.sleep(0.03)
 
-    joystick_thread_stop.set()
+        joystick_binding = _JOYSTICK_POLLER.get_press_after(joystick_start_counter)
+
+        if joystick_binding:
+            finish(joystick_binding)
+            break
+
+        time.sleep(0.03)
 
     with contextlib.suppress(Exception):
         keyboard_listener.stop()
 
     with contextlib.suppress(Exception):
         mouse_listener.stop()
-
-    joystick_thread.join(timeout=1.0)
-
-    if pygame is not None:
-        reset_pygame_joysticks()    
 
     if cancel_event.is_set():
         return None
