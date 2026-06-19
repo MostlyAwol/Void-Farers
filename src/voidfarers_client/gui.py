@@ -502,7 +502,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
-        self.setWindowTitle("Voidfarers Voice Client - Version b1.01")
+        self.setWindowTitle("Voidfarers Voice Client - Version b1.01a")
         self.resize(760, 580)
         self.setMinimumSize(760, 580)
 
@@ -1142,12 +1142,49 @@ class MainWindow(QMainWindow):
         self.ptt_key_edit.setToolTip(describe_ptt_binding(binding))
         self.log(f"PTT set to: {describe_ptt_binding(binding)}")
 
-        @Slot(str)
-        def _on_skipped_connection(self, reason: str) -> None:
-            self.status_label.setText(reason)
-            self.current_room_label.setText("Not connected")
-            self.participants_list.clear()
-            self.log(reason)
+    @Slot()
+    def _clear_worker_refs(self) -> None:
+        self.worker_thread = None
+        self.worker = None
+
+    @Slot(str, str)
+    def _on_connected(self, system_name: str, system_address: str) -> None:
+        self.status_label.setText("Connected")
+        self.current_system_label.setText(f"{system_name} ({system_address})")
+
+        if self.worker and self.worker.voice and self.worker.voice.current_state:
+            state = self.worker.voice.current_state
+            self.current_room_label.setText(state.room_name)
+            self.current_game_mode_label.setText(state.game_mode or "Unknown")
+
+        self.log(f"Connected: {system_name} ({system_address})")
+        self.tray_icon.setToolTip(f"Voidfarers Voice Client\nConnected: {system_name}")
+
+    @Slot()
+    def _on_disconnected(self) -> None:
+        self.status_label.setText("Disconnected")
+        self.connect_button.setEnabled(True)
+        self.disconnect_button.setEnabled(False)
+        self.connect_action.setEnabled(True)
+        self.disconnect_action.setEnabled(False)
+        self._set_controls_enabled(True)
+        self.ptt_status_label.setText("--")
+        self.mic_meter.setValue(0)
+        self.output_buffer_label.setText("0 ms")
+        self.participants_list.clear()
+        self.current_room_label.setText("None")
+        self.current_game_mode_label.setText("Unknown")
+        self.tray_icon.setToolTip("Voidfarers Voice Client\nDisconnected")
+
+        if self._really_quit:
+            QTimer.singleShot(0, self._force_quit)
+
+    @Slot(str)
+    def _on_skipped_connection(self, reason: str) -> None:
+        self.status_label.setText(reason)
+        self.current_room_label.setText("Not connected")
+        self.participants_list.clear()
+        self.log(reason)
 
     @Slot(str, str)
     def _on_system_changed(self, system_name: str, system_address: str) -> None:

@@ -1,4 +1,4 @@
-# Voidfarers Voice Client (VERSION b1.01)
+# Voidfarers Voice Client (VERSION b1.01a)
 
 [Latest Release](https://github.com/MostlyAwol/Void-Farers/releases/latest)
 
