@@ -46,6 +46,7 @@ from .journal import default_journal_dir, read_last_commander_name, watch_system
 from .ptt import PushToTalk, capture_ptt_binding, describe_ptt_binding
 from .voice import VoiceClient
 
+VERSION = "1.02"
 
 def config_get(config: dict[str, Any], key: str, fallback: Any) -> Any:
     value = config.get(key)
@@ -420,11 +421,24 @@ class VoiceWorker(QObject):
         assert self._loop is not None
 
         journal_dir = self.settings.journal_dir or default_journal_dir()
+        expected_commander = self.settings.verified_commander_name or None
         state_queue: asyncio.Queue[SystemState] = asyncio.Queue()
+
+        def watcher_status(message: str) -> None:
+            if not self._loop:
+                return
+
+            self._loop.call_soon_threadsafe(
+                lambda: self.skipped_connection.emit(message)
+            )
 
         def watcher_thread() -> None:
             try:
-                for state in watch_system_changes(journal_dir):
+                for state in watch_system_changes(
+                    journal_dir,
+                    expected_commander_name=expected_commander,
+                    on_status=watcher_status,
+                ):
                     if self._stop_requested or not self.voice or not self.voice.running:
                         break
                     self._loop.call_soon_threadsafe(state_queue.put_nowait, state)
@@ -528,7 +542,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
-        self.setWindowTitle("Voidfarers Voice Client - Version b1.01a")
+        self.setWindowTitle(f"Voidfarers Voice Client - Version {VERSION}")
         self.resize(760, 580)
         self.setMinimumSize(760, 580)
 
